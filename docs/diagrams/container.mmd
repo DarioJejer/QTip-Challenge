@@ -1,0 +1,40 @@
+---
+title: Email Queue Service — C4 Container Diagram
+---
+C4Container
+  title Email Queue Service — Container Diagram
+
+  Person_Ext(apiClient, "SaaS Platform API", "HTTP client that enqueues email tasks")
+
+  System_Boundary(service, "Email Queue Service (Go binary)") {
+    Container(httpApi, "HTTP Producer API", "Go / chi", "Accepts POST /v1/tasks. Validates, authenticates (API key + tenant), and calls TaskProducer. Serves /healthz, /readyz, /metrics.")
+    Container(workerPool, "Worker Pool Supervisor", "Go / goroutines", "Consumes tasks from Redis Streams via XREADGROUP. Dispatches to bounded goroutine pool. Handles ACK/NACK, retries, DLQ routing, and idempotency checks.")
+    Container(delayedScheduler, "Delayed Task Scheduler", "Go / goroutine", "Polls Redis Sorted Set every 1s. Moves tasks with score <= now back to main Streams queue via XADD.")
+    Container(dlqMonitor, "DLQ Monitor", "Go / goroutine", "Scrapes DLQ LIST depths every 30s. Updates Prometheus gauges. Logs warnings on threshold breach.")
+  }
+
+  System_Boundary(redis, "Redis Cluster") {
+    ContainerDb(streamsDb, "Redis Streams", "Redis / Streams", "Main work queues, one per priority band: queue:email:critical/high/normal/low")
+    ContainerDb(sortedSet, "Redis Sorted Set", "Redis / Sorted Set", "Delayed task queue: queue:email:delayed. Score = Unix delivery timestamp.")
+    ContainerDb(dlqList, "Redis LIST", "Redis / LIST", "Dead-letter queues: queue:dlq:{tenantID}:{taskType}. TTL = 7 days.")
+    ContainerDb(idempotencyHash, "Redis Strings", "Redis / Strings + Lua", "Idempotency store: idempotency:{taskID}. TTL = 24h. Lua CAS script prevents duplicate processing.")
+  }
+
+  System_Ext(emailProvider, "Email Provider", "SendGrid / AWS SES")
+  System_Ext(otel, "OTLP Collector", "Jaeger / Tempo / Honeycomb")
+  System_Ext(prom, "Prometheus", "Metrics scraper")
+
+  Rel(apiClient, httpApi, "POST /v1/tasks", "HTTPS, JSON + X-API-Key + X-Tenant-ID")
+  Rel(httpApi, streamsDb, "XADD task", "go-redis")
+  Rel(httpApi, sortedSet, "ZADD (delayed tasks)", "go-redis")
+  Rel(workerPool, streamsDb, "XREADGROUP / XACK / XAUTOCLAIM", "go-redis")
+  Rel(workerPool, idempotencyHash, "Lua CAS (SetProcessing / SetCompleted)", "go-redis EVALSHA")
+  Rel(workerPool, sortedSet, "ZADD (schedule retry)", "go-redis")
+  Rel(workerPool, dlqList, "RPUSH (dead-letter)", "go-redis")
+  Rel(workerPool, emailProvider, "Send email", "HTTPS")
+  Rel(delayedScheduler, sortedSet, "ZRANGEBYSCORE / ZREM", "go-redis")
+  Rel(delayedScheduler, streamsDb, "XADD (re-enqueue ready tasks)", "go-redis")
+  Rel(dlqMonitor, dlqList, "LLEN (depth scrape)", "go-redis")
+  Rel(workerPool, otel, "OTLP spans", "gRPC")
+  Rel(httpApi, otel, "OTLP spans", "gRPC")
+  Rel(prom, httpApi, "GET /metrics", "HTTP")
