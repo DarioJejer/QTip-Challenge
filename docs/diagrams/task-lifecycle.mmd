@@ -1,0 +1,49 @@
+---
+title: Email Task — Happy Path Lifecycle
+---
+sequenceDiagram
+    autonumber
+    participant Client as SaaS Platform API
+    participant HTTP as HTTP Producer API
+    participant Redis as Redis Streams
+    participant Worker as Worker Goroutine
+    participant Idem as Idempotency Store
+    participant Email as Email Provider
+
+    Client->>HTTP: POST /v1/tasks<br/>(X-API-Key, X-Tenant-ID, JSON body)
+    activate HTTP
+
+    HTTP->>HTTP: Validate API key + tenant
+    HTTP->>HTTP: Validate request body (Recipient, Type, TemplateID)
+    HTTP->>HTTP: Build EmailTask{ID=UUIDv4, TraceID=from OTel ctx}
+
+    HTTP->>Redis: XADD queue:email:{priority} * {id, payload, tenant_id, trace_id}
+    Redis-->>HTTP: stream message ID
+
+    HTTP-->>Client: 202 Accepted {task_id, status: "pending"}
+    deactivate HTTP
+
+    Note over Redis,Worker: (Asynchronous — different pod, different time)
+
+    Worker->>Redis: XREADGROUP GROUP email-workers worker-1<br/>COUNT 10 BLOCK 5000 STREAMS queue:email:high >
+    Redis-->>Worker: [{id: "1234-0", fields: {payload: "..."}}]
+    activate Worker
+
+    Worker->>Idem: EVALSHA idempotency_cas.lua<br/>KEYS[idempotency:{taskID}] ARGV[workerID, ttl, now]
+    Idem-->>Worker: 1 (acquired)
+
+    Note over Worker: Start OTel span "worker.process"<br/>continuing from task.TraceID
+
+    Worker->>Email: POST /v3/mail/send {to, template_id, dynamic_template_data}
+    activate Email
+    Email-->>Worker: 202 Accepted
+    deactivate Email
+
+    Worker->>Redis: XACK queue:email:high email-workers 1234-0
+    Redis-->>Worker: OK
+
+    Worker->>Idem: SET idempotency:{taskID} {status:"completed"} EX 86400
+    Idem-->>Worker: OK
+
+    Worker->>Worker: metrics.RecordProcessed(success, duration)<br/>log task.completed<br/>span.End()
+    deactivate Worker
