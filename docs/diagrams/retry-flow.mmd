@@ -1,0 +1,62 @@
+---
+title: Email Task — Retry & DLQ Flow
+---
+sequenceDiagram
+    autonumber
+    participant Stream as Redis Streams<br/>(main queue)
+    participant Worker as Worker Goroutine
+    participant Email as Email Provider
+    participant Retry as Redis Sorted Set<br/>(delayed retry)
+    participant Sched as Delayed Scheduler
+    participant DLQ as Redis LIST<br/>(dead-letter queue)
+
+    Stream->>Worker: XREADGROUP delivers task (attempt=0)
+    activate Worker
+    Worker->>Email: Send email
+    Email-->>Worker: 500 Internal Server Error (retryable)
+
+    Worker->>Worker: IsRetryable(err) = true<br/>attempt(0) < maxAttempts(5)<br/>delay = ComputeDelay(0) = ~1s + jitter
+
+    Worker->>Retry: ZADD queue:email:retry:delayed NX<br/>score=(now+delay) member=task{attempt:1}
+    Retry-->>Worker: OK
+
+    Worker->>Stream: XACK (remove from PEL — retry is now owned by scheduler)
+    Worker->>Worker: log task.retried, metrics.RecordProcessed(failed)
+    deactivate Worker
+
+    Note over Retry,Sched: Scheduler polls every 1 second
+
+    Sched->>Retry: ZRANGEBYSCORE -inf now LIMIT 0 100
+    Retry-->>Sched: [task{attempt:1}]
+
+    Sched->>Stream: XADD queue:email:{priority} * {payload: task{attempt:1}}
+    Sched->>Retry: ZREM queue:email:retry:delayed task{attempt:1}
+
+    Note over Stream,Worker: Task re-enters main queue with attempt=1
+
+    Stream->>Worker: XREADGROUP delivers task (attempt=1)
+    activate Worker
+    Worker->>Email: Send email
+    Email-->>Worker: 500 (retryable again)
+    Worker->>Worker: attempt(1) < maxAttempts(5) → schedule retry (attempt=2, delay~2s)
+    Worker->>Retry: ZADD ... (attempt=2)
+    Worker->>Stream: XACK
+    deactivate Worker
+
+    Note over Stream,Worker: ... (attempts 2, 3, 4 follow same pattern) ...
+
+    Stream->>Worker: XREADGROUP delivers task (attempt=4)
+    activate Worker
+    Worker->>Email: Send email
+    Email-->>Worker: 500 (retryable)
+    Worker->>Worker: attempt(4) >= maxAttempts(5)-1<br/>next attempt would be 5 = maxAttempts<br/>→ route to DLQ
+
+    Worker->>DLQ: RPUSH queue:dlq:{tenantID}:{taskType}<br/>{task, dead_at, failure_reason, attempt_history}
+    DLQ-->>Worker: OK
+    Worker->>DLQ: EXPIRE queue:dlq:... 604800 (7 days)
+
+    Worker->>Stream: XACK (remove from PEL)
+    Worker->>Worker: log task.dead_lettered<br/>metrics.RecordDLQDepth, RecordProcessed(dead)
+    deactivate Worker
+
+    Note over DLQ: Task preserved for 7 days<br/>Operator inspects via GET /v1/dlq<br/>or redis-cli LRANGE
