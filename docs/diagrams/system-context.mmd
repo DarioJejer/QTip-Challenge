@@ -1,0 +1,27 @@
+---
+title: Email Queue Service — C4 System Context
+---
+C4Context
+  title Email Queue Service — System Context
+
+  Person(saasUser, "SaaS Platform User", "Triggers email events via platform workflows")
+  System_Ext(saasApi, "SaaS Platform API", "Produces email tasks via HTTP POST /v1/tasks")
+
+  System_Boundary(emailQueueBoundary, "Email Queue Service") {
+    System(emailQueue, "Email Queue Service", "Async email delivery system. Enqueues, processes, retries, and dead-letters email tasks at 10k–50k msgs/min.")
+  }
+
+  System_Ext(emailProvider, "Email Provider", "SendGrid / AWS SES. Delivers emails to recipients via SMTP/API.")
+  System_Ext(redisCluster, "Redis Cluster", "Message broker. Stores Streams (queues), Sorted Sets (delayed tasks), LISTs (DLQ), and idempotency keys.")
+  System_Ext(prometheus, "Prometheus / Grafana", "Scrapes /metrics endpoint. Stores time-series. Renders dashboards and fires alerts.")
+  System_Ext(jaeger, "Jaeger / Tempo", "Receives OTLP trace spans. Provides distributed trace UI.")
+
+  Rel(saasUser, saasApi, "Triggers email event", "HTTPS")
+  Rel(saasApi, emailQueue, "Enqueues email task", "HTTP POST /v1/tasks, JSON")
+  Rel(emailQueue, redisCluster, "Reads/writes tasks, idempotency, DLQ", "Redis protocol (RESP3)")
+  Rel(emailQueue, emailProvider, "Sends email", "HTTPS / SMTP")
+  Rel(prometheus, emailQueue, "Scrapes metrics", "HTTP GET /metrics")
+  Rel(emailQueue, jaeger, "Exports trace spans", "OTLP gRPC")
+
+  UpdateRelStyle(saasApi, emailQueue, $offsetY="-10")
+  UpdateRelStyle(emailQueue, redisCluster, $offsetX="10")
