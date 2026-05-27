@@ -1,0 +1,41 @@
+---
+title: Worker Goroutine Topology
+---
+flowchart TD
+    main["main()\ncmd/server/main.go"]
+
+    main -->|"signal.NotifyContext\nSIGTERM / SIGINT"| shutdown["ShutdownHandler\n(cancels rootCtx)"]
+    main -->|"errgroup.Go"| httpSrv["HTTP Server goroutine\n:8080\n/healthz /readyz /metrics /v1/tasks"]
+    main -->|"errgroup.Go"| metricsSrv["Metrics Server goroutine\n:9090\n/metrics (promhttp)"]
+    main -->|"errgroup.Go"| supervisor["WorkerSupervisor goroutine\ninternal/worker/supervisor.go"]
+    main -->|"errgroup.Go"| scheduler["DelayedScheduler goroutine\ninternal/worker/delayed_scheduler.go\n(polls Sorted Set every 1s)"]
+    main -->|"errgroup.Go"| dlqMon["DLQMonitor goroutine\ninternal/worker/dlq_monitor.go\n(scrapes LLEN every 30s)"]
+
+    supervisor -->|"XREADGROUP BLOCK 5s\nall 4 priority streams"| redisStreams[("Redis Streams\nqueue:email:critical\nqueue:email:high\nqueue:email:normal\nqueue:email:low")]
+
+    supervisor -->|"sem &lt;- struct{}{}\n(blocks = backpressure)"| sem["Semaphore\nchan struct{}\nsize = WORKER_POOL_SIZE (50)"]
+
+    sem -->|"go processTask(ctx, task)"| w1["Worker goroutine 1\ndefer &lt;-sem\ndefer recover()"]
+    sem -->|"go processTask(ctx, task)"| w2["Worker goroutine 2\ndefer &lt;-sem\ndefer recover()"]
+    sem -->|"go processTask(ctx, task)"| wn["Worker goroutine N\ndefer &lt;-sem\ndefer recover()"]
+
+    w1 & w2 & wn --> idem[("Idempotency Store\nRedis EVALSHA\nidempotency:{taskID}")]
+    w1 & w2 & wn --> emailSender["EmailSender\ninternal/adapters/email\n(SendGrid / Stub)"]
+    w1 & w2 & wn --> ack["XACK / NACK\nRedis Streams"]
+    w1 & w2 & wn --> retrySched[("Retry Sorted Set\nZADD queue:email:retry:delayed")]
+    w1 & w2 & wn --> dlqWriter[("DLQ LIST\nRPUSH queue:dlq:{tenant}:{type}")]
+
+    scheduler -->|"ZRANGEBYSCORE\nZREM + XADD pipeline"| retrySched
+    dlqMon -->|"LLEN"| dlqWriter
+
+    shutdown -->|"rootCtx.Done()\n→ supervisor stops XREADGROUP\n→ workers NACK in-flight\n→ drain(30s)\n→ close Redis\n→ flush OTel"| supervisor
+
+    style main fill:#4a90d9,color:#fff
+    style supervisor fill:#e67e22,color:#fff
+    style sem fill:#27ae60,color:#fff
+    style w1 fill:#8e44ad,color:#fff
+    style w2 fill:#8e44ad,color:#fff
+    style wn fill:#8e44ad,color:#fff
+    style shutdown fill:#e74c3c,color:#fff
+    style scheduler fill:#16a085,color:#fff
+    style dlqMon fill:#16a085,color:#fff
