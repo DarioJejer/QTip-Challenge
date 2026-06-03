@@ -129,8 +129,3 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 		RequestID: RequestIDFromContext(r),
 	})
 }
-
-// contextWith is a generic helper to store a value in a context.
-func contextWith[K ~string, V any](ctx interface{ Value(any) any }, key K, val V) interface{ Value(any) any } {
-	return nil // placeholder — real implementation in context_helpers.go
-}
