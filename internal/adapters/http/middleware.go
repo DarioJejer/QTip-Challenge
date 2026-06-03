@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -50,8 +51,7 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 		if id == "" {
 			id = uuid.New().String()
 		}
-		ctx := r.Context()
-		ctx = contextWith(ctx, contextKeyRequestID, id)
+		ctx := context.WithValue(r.Context(), contextKeyRequestID, id)
 		w.Header().Set("X-Request-ID", id)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -116,8 +116,6 @@ func recovererMiddleware(next http.Handler) http.Handler {
 
 // apiKeyAuthMiddleware returns a middleware that requires the X-API-Key header
 // to match one of the configured valid keys. Returns 401 on failure.
-// The key lookup is O(n) over the small list of configured keys; no map is
-// needed at this scale.
 func apiKeyAuthMiddleware(validKeys []string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +146,7 @@ func tenantExtractorMiddleware(next http.Handler) http.Handler {
 			writeError(w, r, http.StatusBadRequest, "missing_tenant_id", "X-Tenant-ID header is required")
 			return
 		}
-		ctx := contextWith(r.Context(), contextKeyTenantID, tenantID)
+		ctx := context.WithValue(r.Context(), contextKeyTenantID, tenantID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
