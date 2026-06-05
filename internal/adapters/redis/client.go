@@ -16,7 +16,12 @@ import (
 )
 
 // NewRedisClient constructs a go-redis Client from the application config,
-// verifies connectivity with a PING, and registers Prometheus pool-stat gauges.
+// verifies connectivity with a PING, and registers Prometheus pool-stat gauges
+// against the provided registry.
+//
+// The reg parameter must not be nil. Pass prometheus.DefaultRegisterer in
+// production (main.go) and prometheus.NewRegistry() in tests so each test
+// gets an isolated registry with no global state pollution.
 //
 // Connection pool sizing (ADR-006):
 //
@@ -26,7 +31,7 @@ import (
 // saturation. The default config sets PoolSize=75 for PoolSize=50 workers.
 //
 // Returns an error if the PING fails (Redis unreachable or auth rejected).
-func NewRedisClient(cfg *config.Config) (*redis.Client, error) {
+func NewRedisClient(cfg *config.Config, reg prometheus.Registerer) (*redis.Client, error) {
 	opts := &redis.Options{
 		Addr:         addrFromURL(cfg.Redis.URL),
 		Password:     cfg.Redis.Password,
@@ -61,7 +66,7 @@ func NewRedisClient(cfg *config.Config) (*redis.Client, error) {
 		Int("min_idle_conns", opts.MinIdleConns).
 		Msg("redis: client connected")
 
-	registerPoolMetrics(client, prometheus.DefaultRegisterer)
+	registerPoolMetrics(client, reg)
 
 	return client, nil
 }
@@ -131,43 +136,49 @@ func (l *RedisClientLifecycle) Close() error {
 // Prometheus pool metrics (ADR-007)
 // ---------------------------------------------------------------------------
 
-// registerPoolMetrics registers three Prometheus gauges that report the Redis
-// connection pool state. They are scraped on every /metrics collection by
-// calling a background goroutine in M3; in M2 they are registered and will
-// show zero until the pool warms up.
+// registerPoolMetrics registers a poolCollector against reg.
+//
+// Why prometheus.Registerer rather than ports.MetricsRecorder?
+// Pool stats are infrastructure-level pull metrics: Prometheus calls Collect()
+// on each scrape. ports.MetricsRecorder is designed for application-level push
+// events (enqueues, failures, retries). Mixing these two models would make
+// MetricsRecorder responsible for managing scrape-time state, which is not its
+// contract. The correct separation is:
+//   - ports.MetricsRecorder  →  application events recorded imperatively
+//   - prometheus.Registerer  →  infrastructure Collectors registered once at startup
+//
+// Both are injected from main.go; neither reaches for a global.
 func registerPoolMetrics(client *redis.Client, reg prometheus.Registerer) {
-	poolCollector := newPoolCollector(client)
-	// Ignore "already registered" errors — safe in test environments where
-	// multiple clients are constructed against the same default registerer.
-	_ = reg.Register(poolCollector)
+	// Ignore "already registered" errors — safe when the same binary registers
+	// multiple clients (e.g. read replica) against the same registry.
+	_ = reg.Register(newPoolCollector(client))
 }
 
 // poolCollector implements prometheus.Collector for Redis pool statistics.
 type poolCollector struct {
-	client      *redis.Client
-	totalConns  *prometheus.Desc
-	idleConns   *prometheus.Desc
-	staleConns  *prometheus.Desc
+	client     *redis.Client
+	totalConns *prometheus.Desc
+	idleConns  *prometheus.Desc
+	staleConns *prometheus.Desc
 }
 
 func newPoolCollector(client *redis.Client) *poolCollector {
-	labels := prometheus.Labels{}
 	return &poolCollector{
 		client: client,
 		totalConns: prometheus.NewDesc(
 			"redis_pool_total_conns",
 			"Total number of connections in the Redis pool (active + idle).",
-			nil, labels,
+			nil, nil,
 		),
 		idleConns: prometheus.NewDesc(
 			"redis_pool_idle_conns",
 			"Number of idle connections in the Redis pool.",
-			nil, labels,
+			nil, nil,
 		),
 		staleConns: prometheus.NewDesc(
 			"redis_pool_stale_conns",
 			"Number of stale connections removed from the Redis pool.",
-			nil, labels,
+			nil, nil,
 		),
 	}
 }
