@@ -11,7 +11,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
 	_ "go.uber.org/automaxprocs" // ADR-008: GOMAXPROCS = container CPU limit
@@ -20,6 +19,7 @@ import (
 	redisadapter "github.com/DarioJejer/go-email-queue/internal/adapters/redis"
 	"github.com/DarioJejer/go-email-queue/internal/adapters/stubs"
 	"github.com/DarioJejer/go-email-queue/internal/config"
+	"github.com/DarioJejer/go-email-queue/internal/observability"
 )
 
 // version is injected at build time:
@@ -45,11 +45,12 @@ func main() {
 
 	// -------------------------------------------------------------------------
 	// Step 2: Initialise structured logging.
-	// TODO(M2-08): replace initLogger with observability.Init(ctx, cfg) which
-	//              additionally wires the OTel TracerProvider + MeterProvider
-	//              and returns a shutdown flush function.
+	// observability.NewLogger returns a zerolog.Logger configured with the
+	// correct level and format. Assigning it to log.Logger makes it the global
+	// logger so all existing log.Info().Msg(…) call sites keep working.
 	// -------------------------------------------------------------------------
-	initLogger(cfg.Observability.LogLevel, cfg.Observability.LogFormat)
+	observability.Version = version
+	log.Logger = observability.NewLogger(cfg.Observability.LogLevel, cfg.Observability.LogFormat)
 
 	log.Info().
 		Str("version", version).
@@ -62,8 +63,7 @@ func main() {
 	// Prometheus registry — injected explicitly into every component that
 	// registers metrics. Never use prometheus.DefaultRegisterer in application
 	// code; the default registry is reserved for Go runtime / process metrics
-	// only (see registerPoolMetrics for the full rationale).
-	// TODO(M2-08): move registry construction into observability.Init.
+	// only (see registerPoolMetrics in adapters/redis for the full rationale).
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		prometheus.NewGoCollector(),
@@ -74,6 +74,21 @@ func main() {
 	// the signal handler goroutine is cleaned up on exit (ADR-008).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// -------------------------------------------------------------------------
+	// Step 2b: Initialise OpenTelemetry TracerProvider.
+	// Empty OTEL_EXPORTER_OTLP_ENDPOINT → noop provider (zero overhead, safe
+	// for local dev and CI). Set the env var to enable real tracing:
+	//   http://jaeger:4317   plaintext gRPC  (sidecar / local collector)
+	//   https://otel:4317    TLS gRPC        (production)
+	// -------------------------------------------------------------------------
+	shutdownObs, err := observability.InitTracer(ctx, cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialise OpenTelemetry tracer")
+	}
+	log.Info().
+		Bool("tracing_enabled", cfg.Observability.OTELEndpoint != "").
+		Msg("OpenTelemetry tracer initialised")
 
 	// -------------------------------------------------------------------------
 	// Step 3: Connect to Redis and verify connectivity.
@@ -99,10 +114,10 @@ func main() {
 
 	// -------------------------------------------------------------------------
 	// Step 5: Construct port implementations.
-	// All adapters are stubs in M2. Each TODO comment names the M3 issue that
-	// replaces it with the real implementation. The variable names match what
-	// the worker supervisor and HTTP handlers expect so that swapping in real
-	// adapters in M3 is a one-line change per component.
+	// All port adapters except metricsRecorder are stubs in M2. Each TODO
+	// comment names the M3 issue that replaces it. Variable names match the
+	// worker supervisor and HTTP handler signatures so swapping in real
+	// implementations in M3 is a one-line change per adapter.
 	// -------------------------------------------------------------------------
 	producer := stubs.NewStubProducer()
 	// TODO(M3-01): producer = redisadapter.NewRedisProducer(redisClient, cfg, metricsRecorder, tracer)
@@ -123,10 +138,14 @@ func main() {
 	// TODO(M3-07): emailSender = email.NewStubSender(0, 10*time.Millisecond)  // local dev
 	//              emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder) // prod
 
-	metricsRecorder := stubs.NewStubMetricsRecorder()
-	// TODO(M2-08): metricsRecorder = observability.NewPrometheusRecorder(reg)
+	// PrometheusRecorder is fully wired now (resolves TODO from M2 scaffolding).
+	// All ADR-007 application metrics are registered and served at /metrics.
+	// Real usage (RecordEnqueued, RecordProcessed, etc.) comes in M3 when
+	// adapters replace the stubs above.
+	metricsRecorder := observability.NewPrometheusRecorder(reg)
+	log.Info().Msg("Prometheus metrics recorder initialised")
 
-	// Suppress "declared and not used" errors for variables consumed in M3.
+	// Suppress "declared and not used" for stubs consumed in M3.
 	_ = consumer
 	_ = retryScheduler
 	_ = dlqWriter
@@ -135,10 +154,7 @@ func main() {
 	_ = metricsRecorder
 
 	// -------------------------------------------------------------------------
-	// Step 6: Construct application-layer components.
-	// Worker, scheduler, and DLQ monitor are implemented in M3. Their errgroup
-	// goroutines below are no-op stubs that honour context cancellation, keeping
-	// the shutdown sequence correct even before real logic is wired.
+	// Step 6: Construct application-layer components (stubs in M2).
 	// TODO(M3-03): supervisor = worker.NewSupervisor(cfg, consumer, emailSender,
 	//                               idempotencyStore, retryScheduler, dlqWriter,
 	//                               metricsRecorder, tracer)
@@ -154,8 +170,7 @@ func main() {
 	// -------------------------------------------------------------------------
 	// Step 8: Launch all goroutines via errgroup.
 	// No raw go func() calls anywhere in main — every goroutine is supervised
-	// by errgroup so panics and errors are propagated and handled uniformly
-	// (ADR-004 structured concurrency principle applied to the bootstrap layer).
+	// by errgroup so panics and errors are propagated uniformly (ADR-004).
 	// -------------------------------------------------------------------------
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -177,7 +192,7 @@ func main() {
 
 	// --- Prometheus metrics server ---
 	// Served on a separate port so network policy can restrict /metrics to
-	// the Prometheus scraper without exposing it to public traffic (ADR-007).
+	// the Prometheus scraper without exposing it on the public API port.
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		EnableOpenMetrics: true,
@@ -230,7 +245,7 @@ func main() {
 	//          waits for in-flight requests to complete
 	//   T+30s  drain timeout → force-close remaining connections
 	//   T+30s  redisLifecycle.Close() — log pool stats, close all connections
-	//   T+30s  OTel flush (TODO M2-08)
+	//   T+30s  shutdownObs(drainCtx) — flush OTel spans and metrics
 	//
 	// terminationGracePeriodSeconds=60 in the pod spec gives a 30s buffer
 	// between drain completion and SIGKILL (ADR-008).
@@ -238,7 +253,7 @@ func main() {
 		<-gCtx.Done()
 		log.Info().Msg("shutdown signal received — beginning graceful drain")
 
-		// Step 1: flip readiness probe so the load balancer stops routing traffic.
+		// Step 1: flip readiness probe so the load balancer stops routing.
 		router.SetReady(false)
 
 		// Step 2: drain HTTP servers within the configured budget.
@@ -262,7 +277,12 @@ func main() {
 			log.Warn().Err(err).Msg("Redis close error")
 		}
 
-		// TODO(M2-08): shutdownObs(drainCtx) — flush OTel spans and metrics
+		// Step 4: flush OTel spans and metrics before the process exits.
+		if err := shutdownObs(drainCtx); err != nil {
+			log.Warn().Err(err).Msg("OTel shutdown error")
+		} else {
+			log.Info().Msg("OTel flushed")
+		}
 
 		log.Info().Msg("graceful shutdown complete")
 		return nil
@@ -274,30 +294,4 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info().Msg("service stopped cleanly")
-}
-
-// initLogger configures the global zerolog logger.
-// JSON is the default (zerolog zero-allocation path, production-ready).
-// Console mode enables coloured human-readable output for local development.
-//
-// TODO(M2-08): replace with observability.NewLogger(cfg) which also attaches
-// the OTel trace/span IDs to every log line via a zerolog hook.
-func initLogger(level, format string) {
-	var lvl zerolog.Level
-	switch level {
-	case "debug":
-		lvl = zerolog.DebugLevel
-	case "warn":
-		lvl = zerolog.WarnLevel
-	case "error":
-		lvl = zerolog.ErrorLevel
-	default:
-		lvl = zerolog.InfoLevel
-	}
-	zerolog.SetGlobalLevel(lvl)
-
-	if format == "console" {
-		log.Logger = log.Output(zerolog.NewConsoleWriter())
-	}
-	// JSON is zerolog's default output format — no-op needed for production.
 }
