@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -29,6 +30,14 @@ func newTestConfig(addr string) *config.Config {
 	}
 }
 
+// testRegistry returns a fresh isolated Prometheus registry for each test.
+// Using prometheus.NewRegistry() instead of prometheus.DefaultRegisterer
+// ensures no global state leaks between tests — each test owns its own
+// collector set and there are no "already registered" conflicts.
+func testRegistry() prometheus.Registerer {
+	return prometheus.NewRegistry()
+}
+
 // ---------------------------------------------------------------------------
 // NewRedisClient
 // ---------------------------------------------------------------------------
@@ -37,7 +46,7 @@ func TestNewRedisClient_Success(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := newTestConfig(mr.Addr())
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	require.NoError(t, err)
 	require.NotNil(t, client)
 	t.Cleanup(func() { _ = client.Close() })
@@ -54,7 +63,7 @@ func TestNewRedisClient_Unreachable(t *testing.T) {
 	cfg := newTestConfig("localhost:19999") // nothing listening here
 	cfg.Redis.DialTimeout = 300 * time.Millisecond
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	assert.Error(t, err, "should fail when Redis is unreachable")
 	assert.Nil(t, client)
 	assert.Contains(t, err.Error(), "ping failed")
@@ -68,7 +77,7 @@ func TestHealthCheck_Success(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := newTestConfig(mr.Addr())
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -80,7 +89,7 @@ func TestHealthCheck_FailsWhenServerDown(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := newTestConfig(mr.Addr())
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -102,7 +111,7 @@ func TestLoadScripts_Success(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := newTestConfig(mr.Addr())
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -117,7 +126,7 @@ func TestLoadScripts_Idempotent(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := newTestConfig(mr.Addr())
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -140,9 +149,36 @@ func TestClose_Success(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := newTestConfig(mr.Addr())
 
-	client, err := redisadapter.NewRedisClient(cfg)
+	client, err := redisadapter.NewRedisClient(cfg, testRegistry())
 	require.NoError(t, err)
 
 	lc := redisadapter.NewRedisClientLifecycle(client)
 	assert.NoError(t, lc.Close())
+}
+
+// ---------------------------------------------------------------------------
+// Pool metrics — collector registers against the injected registry
+// ---------------------------------------------------------------------------
+
+func TestNewRedisClient_RegistersPoolMetrics(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := newTestConfig(mr.Addr())
+
+	reg := prometheus.NewRegistry()
+	client, err := redisadapter.NewRedisClient(cfg, reg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Gathering from the isolated registry must return the three pool metrics
+	// without error. The global DefaultRegisterer must be untouched.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	names := make(map[string]bool)
+	for _, mf := range mfs {
+		names[mf.GetName()] = true
+	}
+	assert.True(t, names["redis_pool_total_conns"], "redis_pool_total_conns must be registered")
+	assert.True(t, names["redis_pool_idle_conns"], "redis_pool_idle_conns must be registered")
+	assert.True(t, names["redis_pool_stale_conns"], "redis_pool_stale_conns must be registered")
 }
