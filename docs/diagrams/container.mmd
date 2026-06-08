@@ -7,17 +7,18 @@ C4Container
   Person_Ext(apiClient, "SaaS Platform API", "HTTP client that enqueues email tasks")
 
   System_Boundary(service, "Email Queue Service (Go binary)") {
-    Container(httpApi, "HTTP Producer API", "Go / chi", "Accepts POST /v1/tasks. Validates, authenticates (API key + tenant), and calls TaskProducer. Serves /healthz, /readyz, /metrics.")
-    Container(workerPool, "Worker Pool Supervisor", "Go / goroutines", "Consumes tasks from Redis Streams via XREADGROUP. Dispatches to bounded goroutine pool. Handles ACK/NACK, retries, DLQ routing, and idempotency checks.")
+    Container(httpApi, "HTTP Producer API", "Go / chi :8080", "Accepts POST /v1/tasks. Validates, authenticates (API key + tenant), and calls TaskProducer. Serves /healthz and /readyz.")
+    Container(metricsApi, "Metrics Server", "Go / promhttp :9090", "Serves GET /metrics for Prometheus scraping. Isolated port — not exposed to public traffic. Shares the same in-process Prometheus registry as all other containers.")
+    Container(workerPool, "Worker Pool Supervisor", "Go / goroutines", "Consumes tasks from Redis Streams via XREADGROUP. Dispatches to bounded goroutine pool. Handles ACK (XACK), PEL re-delivery (no-XACK), retries, DLQ routing, and idempotency checks. Updates Prometheus gauges via shared registry.")
     Container(delayedScheduler, "Delayed Task Scheduler", "Go / goroutine", "Polls Redis Sorted Set every 1s. Moves tasks with score <= now back to main Streams queue via XADD.")
-    Container(dlqMonitor, "DLQ Monitor", "Go / goroutine", "Scrapes DLQ LIST depths every 30s. Updates Prometheus gauges. Logs warnings on threshold breach.")
+    Container(dlqMonitor, "DLQ Monitor", "Go / goroutine", "Scrapes DLQ LIST depths every 30s. Updates email_queue_dlq_depth Prometheus gauges via shared registry. Logs warnings on threshold breach.")
   }
 
   System_Boundary(redis, "Redis Cluster") {
-    ContainerDb(streamsDb, "Redis Streams", "Redis / Streams", "Main work queues, one per priority band: queue:email:critical/high/normal/low")
+    ContainerDb(streamsDb, "Redis Streams", "Redis / Streams", "Main work queues, one per priority band: {queue}:email:critical/high/normal/low")
     ContainerDb(sortedSet, "Redis Sorted Set", "Redis / Sorted Set", "Delayed task queue: queue:email:delayed. Score = Unix delivery timestamp.")
     ContainerDb(dlqList, "Redis LIST", "Redis / LIST", "Dead-letter queues: queue:dlq:{tenantID}:{taskType}. TTL = 7 days.")
-    ContainerDb(idempotencyHash, "Redis Strings", "Redis / Strings + Lua", "Idempotency store: idempotency:{taskID}. TTL = 24h. Lua CAS script prevents duplicate processing.")
+    ContainerDb(idempotencyHash, "Redis Strings", "Redis / Strings + Lua", "Idempotency store: idempotency:{taskID}. TTL = 24h. Atomic CAS via EVALSHA from worker goroutines prevents duplicate processing.")
   }
 
   System_Ext(emailProvider, "Email Provider", "SendGrid / AWS SES")
@@ -37,4 +38,6 @@ C4Container
   Rel(dlqMonitor, dlqList, "LLEN (depth scrape)", "go-redis")
   Rel(workerPool, otel, "OTLP spans", "gRPC")
   Rel(httpApi, otel, "OTLP spans", "gRPC")
-  Rel(prom, httpApi, "GET /metrics", "HTTP")
+  Rel(prom, metricsApi, "GET /metrics :9090", "HTTP")
+  Rel(workerPool, metricsApi, "RecordEnqueued / RecordProcessed / RecordWorkerStats", "in-process")
+  Rel(dlqMonitor, metricsApi, "RecordDLQDepth", "in-process")

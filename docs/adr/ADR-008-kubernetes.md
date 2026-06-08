@@ -1,7 +1,7 @@
 # ADR-008: Kubernetes Operational Contract
 
-**Status:** Accepted
-**Date:** 2026-05-27
+**Status:** Accepted  
+**Date:** 2026-05-27  
 **Deciders:** Engineering Team
 
 ---
@@ -53,7 +53,7 @@ livenessProbe:
 ### Readiness Probe — `GET /readyz`
 
 The readiness probe determines whether the pod should receive traffic. For a pull-based worker, "traffic" means:
-- Being scraped by Prometheus on `/metrics`
+- Being scraped by Prometheus on `/metrics` (port 9090)
 - Being included in any future admin API load balancer
 
 It returns `200 OK` when:
@@ -72,10 +72,12 @@ readinessProbe:
   initialDelaySeconds: 5
   periodSeconds: 5
   failureThreshold: 2       # 10s not ready → remove from endpoints
-  timeoutSeconds: 3
+  timeoutSeconds: 3         # allow for Redis PING under load
 ```
 
 **Readiness vs Liveness for pull workers:** Unlike HTTP servers, a pull-based worker doesn't receive Kubernetes-routed traffic. However, readiness still matters because: (1) Prometheus ServiceMonitor uses endpoint selection, and (2) it gates the rolling update — new pods must be ready before old pods are terminated.
+
+> **M2 implementation note:** In M2, `router.SetReady(true)` is called when the HTTP server goroutine starts, which is earlier than the full readiness condition described above (consumer groups not yet created — those are M3 stubs). This is acceptable for the skeleton milestone. **Action item for M3:** move `SetReady(true)` to after `RunMigrations` and consumer group initialisation succeed, so the probe accurately reflects the worker's ability to consume.
 
 ---
 
@@ -92,10 +94,12 @@ T + 0s    router.SetReady(false)
 T + 0s    WorkerSupervisor: stops XREADGROUP polling
           → No new tasks dequeued
 T + 0s    In-flight processTask goroutines: ctx.Done() fires on next context check
-          → Workers that haven't started Send: NACK (message stays in PEL)
+          → Workers that have not yet called Send: do NOT call XACK
+            The message remains in the PEL and will be reclaimed by
+            XAUTOCLAIM after the idle threshold expires on a surviving pod.
           → Workers mid-Send: complete the send, then XACK with context.Background()
 T + 0–30s Drain loop: polls semaphore every 5s, logs in-flight count
-T + 30s   Drain timeout (DRAIN_TIMEOUT_SECONDS=30, configurable)
+T + 30s   Drain timeout (DRAIN_TIMEOUT=30s, configurable)
           → Log warning if slots still occupied
 T + 30s   Flush OTel spans and metrics
 T + 30s   Close Redis connections (logs pool stats)
@@ -103,6 +107,8 @@ T + 30s   os.Exit(0)
 T + 60s   Kubernetes sends SIGKILL (terminationGracePeriodSeconds=60)
           → 30s safety buffer; pod is gone by T+30s in normal operation
 ```
+
+> **Redis Streams has no NACK command.** "Not ACKing" is the mechanism — the PEL entry ages in place. When `XAUTOCLAIM` runs on a surviving pod after `cfg.ClaimIdleThreshold`, it reclaims any messages whose PEL idle time has exceeded the threshold and re-dispatches them. This is why the drain timeout is set conservatively at 30s: it covers the worst-case in-flight task, after which any remaining tasks are safely reclaimed by other pods via PEL.
 
 ### Why 30s drain + 30s buffer = 60s terminationGracePeriodSeconds
 
@@ -129,6 +135,39 @@ lifecycle:
 
 The worker pool scales based on **queue depth** (the primary signal) and **worker saturation** (the secondary signal). CPU and memory are poor scaling signals for this workload — a saturated worker pool has high CPU not because it needs more CPU, but because it needs more replicas.
 
+### Required Prometheus recording rules
+
+Two recording rules must be deployed (e.g. via a `PrometheusRule` CR) before the HPA custom metrics are available:
+
+```yaml
+# deploy alongside the service in the email-queue namespace
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: email-queue-hpa-rules
+spec:
+  groups:
+    - name: email_queue_hpa
+      interval: 15s
+      rules:
+        # Aggregate queue depth across ALL four priority streams.
+        # Monitoring only one stream (e.g. "normal") would miss spikes
+        # in critical/high queues, delaying scale-out when it matters most.
+        - record: email_queue_depth_total
+          expr: sum(email_queue_depth) by (job)
+
+        # Worker saturation ratio — used as secondary HPA signal.
+        # email_queue_worker_active / email_queue_worker_pool_size
+        # Both metrics are Gauges registered in observability.PrometheusRecorder.
+        - record: email_queue_worker_saturation
+          expr: >
+            email_queue_worker_active
+            /
+            email_queue_worker_pool_size
+```
+
+> Without these rules deployed, the HPA will fail to resolve the custom metrics and silently fall back to the CPU utilisation target only.
+
 ### Custom metric: queue depth
 
 ```yaml
@@ -144,24 +183,22 @@ spec:
   minReplicas: 2
   maxReplicas: 20
   metrics:
-    # Primary: queue depth via Prometheus Adapter
+    # Primary: total queue depth across all four priority streams.
+    # Uses the email_queue_depth_total recording rule defined above.
     - type: External
       external:
         metric:
-          name: email_queue_depth
-          selector:
-            matchLabels:
-              queue_name: "queue:email:normal"
+          name: email_queue_depth_total
         target:
           type: AverageValue
-          averageValue: "1000"   # scale up when depth > 1000 per replica
+          averageValue: "1000"   # scale up when total depth > 1000 per replica
 
-    # Secondary: worker saturation
+    # Secondary: worker saturation ratio (0–1).
+    # Uses the email_queue_worker_saturation recording rule defined above.
     - type: External
       external:
         metric:
           name: email_queue_worker_saturation
-          # Computed as: email_queue_worker_active / email_queue_worker_pool_size
         target:
           type: AverageValue
           averageValue: "800m"   # 0.8 = 80% saturation threshold
@@ -282,7 +319,7 @@ metadata:
   name: email-queue-config
 data:
   WORKER_POOL_SIZE: "50"
-  WORKER_DRAIN_TIMEOUT_SECONDS: "30"
+  DRAIN_TIMEOUT: "30s"              # duration string — matches parseDuration() in config.go
   RETRY_BASE_DELAY: "1s"
   RETRY_MAX_DELAY: "15m"
   LOG_LEVEL: "info"
@@ -327,9 +364,12 @@ securityContext:
   allowPrivilegeEscalation: false
   capabilities:
     drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault    # enables the node's default seccomp filter;
+                            # required by PSA restricted profile and CIS benchmark
 ```
 
-The distroless base image runs as user 65532 by default. `readOnlyRootFilesystem: true` prevents any runtime file writes (the binary only writes to stdout/stderr). This satisfies most CIS Kubernetes Benchmark requirements.
+The distroless base image runs as user 65532 by default. `readOnlyRootFilesystem: true` prevents any runtime file writes (the binary only writes to stdout/stderr). `seccompProfile: RuntimeDefault` applies the containerd/runc default seccomp policy, blocking ~300 rarely-used syscalls without any application changes. This satisfies CIS Kubernetes Benchmark and Pod Security Admission (restricted) requirements.
 
 ---
 
@@ -339,13 +379,15 @@ The distroless base image runs as user 65532 by default. `readOnlyRootFilesystem
 topologySpreadConstraints:
   - maxSkew: 1
     topologyKey: topology.kubernetes.io/zone
-    whenUnsatisfiable: DoNotSchedule
+    whenUnsatisfiable: ScheduleAnyway   # prefer spread; never block scheduling
     labelSelector:
       matchLabels:
         app: email-queue-worker
 ```
 
 Ensures worker pods are spread across availability zones, preventing a full outage if one zone goes down.
+
+`ScheduleAnyway` is used rather than `DoNotSchedule` so that pods are never left `Pending` in single-AZ clusters or during initial rollout when zone spread cannot be satisfied. Once multi-AZ topology is confirmed in production, tighten to `DoNotSchedule` for strict zone isolation.
 
 ---
 
@@ -357,8 +399,8 @@ Ensures worker pods are spread across availability zones, preventing a full outa
 | Worker pod OOMKilled | K8s event + Prometheus `kube_pod_container_status_last_terminated_reason` | Pod restarted; PEL retains in-flight tasks |
 | Rolling deploy | readyz 503 on old pod | New pod must pass readiness before old pod SIGTERM |
 | Node drain | PDB blocks drain until min 1 available | Graceful drain before eviction |
-| Campaign spike | HPA queue-depth metric exceeds threshold | Scale out; stabilization prevents thrash |
-| SIGTERM under load | Drain timeout | Tasks NACKed → PEL → reclaimed by surviving pods |
+| Campaign spike | HPA `email_queue_depth_total` metric exceeds threshold | Scale out across all priority queues; stabilization prevents thrash |
+| SIGTERM under load | Drain timeout | Tasks not ACKed → PEL → reclaimed by XAUTOCLAIM on surviving pods |
 
 ---
 
@@ -366,18 +408,19 @@ Ensures worker pods are spread across availability zones, preventing a full outa
 
 **What becomes easier:**
 - Zero-message-loss rolling deployments are guaranteed by `maxUnavailable: 0`
-- HPA responds to actual work backlog (queue depth), not proxy signals (CPU)
-- Security baseline is strong (non-root, read-only FS, no capabilities)
+- HPA responds to actual work backlog (total queue depth across all priorities), not proxy signals (CPU)
+- Security baseline is strong (non-root, read-only FS, no capabilities, RuntimeDefault seccomp)
 - Topology spread prevents single-AZ failures from taking down all workers
 
 **What becomes harder:**
-- Custom HPA metrics require `prometheus-adapter` deployed in the cluster
+- Custom HPA metrics require `prometheus-adapter` deployed in the cluster **and** the `PrometheusRule` recording rules from §3 applied
 - `terminationGracePeriodSeconds: 60` means rolling deployments take ~60s per pod — a 10-pod deployment takes ~10 minutes (acceptable for this workload)
 - `readOnlyRootFilesystem: true` requires any temp file writes (e.g. profiling) to use `emptyDir` volumes
 
 **What we will need to revisit:**
-- If email provider latency degrades beyond 30s, increase `DRAIN_TIMEOUT_SECONDS` and `terminationGracePeriodSeconds` accordingly
+- If email provider latency degrades beyond 30s, increase `DRAIN_TIMEOUT` and `terminationGracePeriodSeconds` accordingly
 - If the cluster does not support custom metrics, fall back to CPU-based HPA with a conservative target (50%)
+- Change `whenUnsatisfiable` from `ScheduleAnyway` to `DoNotSchedule` once multi-AZ topology is verified
 
 ---
 
@@ -385,11 +428,13 @@ Ensures worker pods are spread across availability zones, preventing a full outa
 
 1. [ ] Implement `GET /healthz` handler with supervisor heartbeat + Redis PING check
 2. [ ] Implement `GET /readyz` handler with readiness flag (SetReady/IsReady)
-3. [ ] Set `terminationGracePeriodSeconds: 60` in Deployment spec
-4. [ ] Add `preStop: sleep 5` lifecycle hook
-5. [ ] Configure HPA with queue-depth custom metric via prometheus-adapter
-6. [ ] Create PodDisruptionBudget with `minAvailable: 1`
-7. [ ] Set `maxUnavailable: 0, maxSurge: 1` rolling update strategy
-8. [ ] Add `go.uber.org/automaxprocs` import to `cmd/server/main.go`
-9. [ ] Set `readOnlyRootFilesystem: true` and drop all capabilities in securityContext
-10. [ ] Add topology spread constraints for AZ distribution
+3. [ ] **(M3)** Move `SetReady(true)` to after consumer group initialisation succeeds
+4. [ ] Set `terminationGracePeriodSeconds: 60` in Deployment spec
+5. [ ] Add `preStop: sleep 5` lifecycle hook
+6. [ ] Deploy `PrometheusRule` CR with `email_queue_depth_total` and `email_queue_worker_saturation` recording rules
+7. [ ] Configure HPA with `email_queue_depth_total` (all queues) and `email_queue_worker_saturation` custom metrics
+8. [ ] Create PodDisruptionBudget with `minAvailable: 1`
+9. [ ] Set `maxUnavailable: 0, maxSurge: 1` rolling update strategy
+10. [ ] Add `go.uber.org/automaxprocs` import to `cmd/server/main.go`
+11. [ ] Set `readOnlyRootFilesystem: true`, drop all capabilities, and add `seccompProfile: RuntimeDefault`
+12. [ ] Add topology spread constraints with `ScheduleAnyway`; tighten to `DoNotSchedule` post multi-AZ verification
