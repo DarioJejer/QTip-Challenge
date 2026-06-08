@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 	_ "go.uber.org/automaxprocs" // ADR-008: GOMAXPROCS = container CPU limit
 
@@ -90,6 +91,10 @@ func main() {
 		Bool("tracing_enabled", cfg.Observability.OTELEndpoint != "").
 		Msg("OpenTelemetry tracer initialised")
 
+	// tracer is obtained from whichever TracerProvider InitTracer registered:
+	// a noop provider when OTEL is disabled, or the OTLP provider otherwise.
+	tracer := otel.GetTracerProvider().Tracer("email-queue")
+
 	// -------------------------------------------------------------------------
 	// Step 3: Connect to Redis and verify connectivity.
 	// Fatal on failure — the service has no meaningful behaviour without Redis.
@@ -114,13 +119,15 @@ func main() {
 
 	// -------------------------------------------------------------------------
 	// Step 5: Construct port implementations.
-	// All port adapters except metricsRecorder are stubs in M2. Each TODO
-	// comment names the M3 issue that replaces it. Variable names match the
-	// worker supervisor and HTTP handler signatures so swapping in real
-	// implementations in M3 is a one-line change per adapter.
 	// -------------------------------------------------------------------------
-	producer := stubs.NewStubProducer()
-	// TODO(M3-01): producer = redisadapter.NewRedisProducer(redisClient, cfg, metricsRecorder, tracer)
+
+	// PrometheusRecorder — all ADR-007 application metrics registered here.
+	// Constructed before the producer so it can be injected immediately.
+	metricsRecorder := observability.NewPrometheusRecorder(reg)
+	log.Info().Msg("Prometheus metrics recorder initialised")
+
+	// M3-01: Real Redis Streams producer (replaces stub).
+	producer := redisadapter.NewRedisProducer(redisClient, cfg, metricsRecorder, tracer)
 
 	consumer := stubs.NewStubConsumer()
 	// TODO(M3-02): consumer = redisadapter.NewRedisConsumer(redisClient, cfg, metricsRecorder, tracer)
@@ -138,20 +145,12 @@ func main() {
 	// TODO(M3-07): emailSender = email.NewStubSender(0, 10*time.Millisecond)  // local dev
 	//              emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder) // prod
 
-	// PrometheusRecorder is fully wired now (resolves TODO from M2 scaffolding).
-	// All ADR-007 application metrics are registered and served at /metrics.
-	// Real usage (RecordEnqueued, RecordProcessed, etc.) comes in M3 when
-	// adapters replace the stubs above.
-	metricsRecorder := observability.NewPrometheusRecorder(reg)
-	log.Info().Msg("Prometheus metrics recorder initialised")
-
-	// Suppress "declared and not used" for stubs consumed in M3.
+	// Suppress "declared and not used" for stubs that M3 issues will replace.
 	_ = consumer
 	_ = retryScheduler
 	_ = dlqWriter
 	_ = idempotencyStore
 	_ = emailSender
-	_ = metricsRecorder
 
 	// -------------------------------------------------------------------------
 	// Step 6: Construct application-layer components (stubs in M2).
