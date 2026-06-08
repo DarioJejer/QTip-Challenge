@@ -1,0 +1,100 @@
+# =============================================================================
+# golangci-lint configuration
+# Docs: https://golangci-lint.run/usage/configuration/
+# =============================================================================
+
+run:
+  timeout: 5m
+  tests: true          # lint test files as well
+  modules-download-mode: readonly
+
+linters:
+  disable-all: true
+  enable:
+    # --- correctness ---
+    - errcheck        # requires all errors to be checked
+    - govet           # reports suspicious constructs (shadow, printf, etc.)
+    - ineffassign     # detects assignments to variables never used afterwards
+    - staticcheck     # extensive static analysis (SA*, S*, ST*, QF* checks)
+    - unused          # reports unexported identifiers that are never used
+
+    # --- style ---
+    - gofmt           # enforces gofmt formatting
+    - goimports       # enforces import grouping: stdlib / external / internal
+    - revive          # configurable replacement for golint
+    - gocritic        # opinionated but useful style checks
+
+    # --- simplification ---
+    - gosimple        # suggests simpler code constructs
+
+    # --- exhaustiveness ---
+    - exhaustive      # checks exhaustiveness of enum switch statements
+
+linters-settings:
+  goimports:
+    # Group internal module imports separately from third-party imports.
+    local-prefixes: github.com/DarioJejer/go-email-queue
+
+  revive:
+    rules:
+      # Require godoc comments on all exported symbols.
+      - name: exported
+        disabled: false
+      # Enforce Go naming conventions (camelCase, initialisms, etc.).
+      - name: var-naming
+        disabled: false
+      # Disallow blank imports except in main and test packages.
+      - name: blank-imports
+        disabled: false
+
+  exhaustive:
+    # A switch with a `default` case is considered exhaustive even if it
+    # doesn't list every enum value explicitly. This prevents noise on
+    # switches that intentionally handle the general case via default.
+    default-signifies-exhaustive: true
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+    disabled-checks:
+      - hugeParam        # false positives on domain structs passed by value
+      - unnamedResult    # too noisy for small helper functions
+
+  staticcheck:
+    checks: ["all", "-ST1000", "-ST1003"]  # disable package-comment and naming
+
+issues:
+  exclude-rules:
+    # Test files: relax errcheck and gocritic — test helpers often intentionally
+    # ignore errors (e.g. defer resp.Body.Close()).
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic
+
+    # Generated files: suppress all linters (protobuf, mocks, etc.).
+    - path: \.pb\.go$
+      linters:
+        - revive
+        - govet
+        - errcheck
+        - staticcheck
+        - unused
+        - gofmt
+        - goimports
+
+    - path: _gen\.go$
+      linters:
+        - revive
+        - govet
+        - errcheck
+        - staticcheck
+        - unused
+        - gofmt
+        - goimports
+
+  # Report every issue, not just the first N per linter or file.
+  max-issues-per-linter: 0
+  max-same-issues: 0

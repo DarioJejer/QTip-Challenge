@@ -1,0 +1,110 @@
+# =============================================================================
+# docker-compose.yml — local development stack
+# =============================================================================
+# Services:
+#   redis         — Redis 7.2 with AOF persistence and health check (always on)
+#   redis-insight — RedisInsight UI on :8001  (opt-in: --profile insight)
+#   app           — email-queue service built from Dockerfile
+#
+# Quick start:
+#   docker-compose up           # Redis + app
+#   docker-compose up -d redis  # Redis only (for `make run`)
+#   docker-compose --profile insight up  # Redis + RedisInsight + app
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis 7.2
+  # AOF persistence (appendonly yes) ensures queued tasks survive container
+  # restarts during local development. Data is stored in the redis-data volume.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: email-queue-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --loglevel notice
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+
+  # ---------------------------------------------------------------------------
+  # RedisInsight — optional browser UI for inspecting Redis data
+  # Start with: docker-compose --profile insight up
+  # Open:       http://localhost:8001
+  # ---------------------------------------------------------------------------
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    container_name: email-queue-redisinsight
+    ports:
+      - "8001:5540"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - insight
+
+  # ---------------------------------------------------------------------------
+  # email-queue app
+  # Built from the multi-stage Dockerfile in the repo root.
+  # All config is supplied via environment variables (no config files baked in
+  # to the image) as per ADR-008 ConfigMap/Secret strategy.
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+    container_name: email-queue-app
+    ports:
+      - "8080:8080"   # HTTP API
+      - "9090:9090"   # Prometheus metrics
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # --- Redis ---
+      REDIS_URL: redis://redis:6379
+      REDIS_POOL_SIZE: "75"
+      REDIS_MIN_IDLE_CONNS: "10"
+      REDIS_DIAL_TIMEOUT: "5s"
+      REDIS_READ_TIMEOUT: "3s"
+      REDIS_WRITE_TIMEOUT: "3s"
+
+      # --- Worker ---
+      WORKER_POOL_SIZE: "50"
+      WORKER_CONSUMER_GROUP: email-workers
+      WORKER_BLOCK_TIMEOUT: "5s"
+      WORKER_CLAIM_IDLE_THRESHOLD: "30s"
+      DRAIN_TIMEOUT: "30s"
+
+      # --- Retry ---
+      RETRY_BASE_DELAY: "1s"
+      RETRY_MAX_DELAY: "15m"
+      RETRY_JITTER_FACTOR: "0.2"
+      RETRY_SCHEDULER_INTERVAL: "1s"
+      DLQ_TTL_SECONDS: "604800"
+
+      # --- Observability ---
+      LOG_LEVEL: info
+      LOG_FORMAT: console     # human-readable for local dev; use json in prod
+      METRICS_PORT: "9090"
+      HTTP_PORT: "8080"
+      OTEL_SERVICE_NAME: email-queue
+      # OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+
+      # --- Server ---
+      # IMPORTANT: replace with real API keys before exposing to the network
+      API_KEYS: dev-key-1,dev-key-2
+
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+    driver: local
