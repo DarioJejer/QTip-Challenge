@@ -31,8 +31,6 @@ var version = "dev"
 func main() {
 	// -------------------------------------------------------------------------
 	// Step 1: Load and validate configuration.
-	// All required env vars are checked here; missing values cause a fatal exit
-	// so misconfigurations are caught at startup, not at runtime (ADR-008).
 	// -------------------------------------------------------------------------
 	cfg, err := config.Load()
 	if err != nil {
@@ -46,9 +44,6 @@ func main() {
 
 	// -------------------------------------------------------------------------
 	// Step 2: Initialise structured logging.
-	// observability.NewLogger returns a zerolog.Logger configured with the
-	// correct level and format. Assigning it to log.Logger makes it the global
-	// logger so all existing log.Info().Msg(…) call sites keep working.
 	// -------------------------------------------------------------------------
 	observability.Version = version
 	log.Logger = observability.NewLogger(cfg.Observability.LogLevel, cfg.Observability.LogFormat)
@@ -61,27 +56,17 @@ func main() {
 		Int("worker_pool_size", cfg.Worker.PoolSize).
 		Msg("starting email-queue service")
 
-	// Prometheus registry — injected explicitly into every component that
-	// registers metrics. Never use prometheus.DefaultRegisterer in application
-	// code; the default registry is reserved for Go runtime / process metrics
-	// only (see registerPoolMetrics in adapters/redis for the full rationale).
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)
 
-	// Root context: cancelled on SIGTERM or SIGINT. stop() must be deferred so
-	// the signal handler goroutine is cleaned up on exit (ADR-008).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// -------------------------------------------------------------------------
 	// Step 2b: Initialise OpenTelemetry TracerProvider.
-	// Empty OTEL_EXPORTER_OTLP_ENDPOINT → noop provider (zero overhead, safe
-	// for local dev and CI). Set the env var to enable real tracing:
-	//   http://jaeger:4317   plaintext gRPC  (sidecar / local collector)
-	//   https://otel:4317    TLS gRPC        (production)
 	// -------------------------------------------------------------------------
 	shutdownObs, err := observability.InitTracer(ctx, cfg)
 	if err != nil {
@@ -91,13 +76,10 @@ func main() {
 		Bool("tracing_enabled", cfg.Observability.OTELEndpoint != "").
 		Msg("OpenTelemetry tracer initialised")
 
-	// tracer is obtained from whichever TracerProvider InitTracer registered:
-	// a noop provider when OTEL is disabled, or the OTLP provider otherwise.
 	tracer := otel.GetTracerProvider().Tracer("email-queue")
 
 	// -------------------------------------------------------------------------
-	// Step 3: Connect to Redis and verify connectivity.
-	// Fatal on failure — the service has no meaningful behaviour without Redis.
+	// Step 3: Connect to Redis.
 	// -------------------------------------------------------------------------
 	redisClient, err := redisadapter.NewRedisClient(cfg, reg)
 	if err != nil {
@@ -107,9 +89,7 @@ func main() {
 	log.Info().Str("addr", cfg.Redis.URL).Msg("Redis connection established")
 
 	// -------------------------------------------------------------------------
-	// Step 4: Load Lua scripts into the Redis script cache.
-	// Scripts must be loaded before workers start so EVALSHA calls don't fail
-	// with NOSCRIPT errors on the first task (ADR-006).
+	// Step 4: Load Lua scripts.
 	// -------------------------------------------------------------------------
 	scripts, err := redisadapter.LoadScripts(ctx, redisClient)
 	if err != nil {
@@ -121,16 +101,15 @@ func main() {
 	// Step 5: Construct port implementations.
 	// -------------------------------------------------------------------------
 
-	// PrometheusRecorder — all ADR-007 application metrics registered here.
-	// Constructed before the producer so it can be injected immediately.
+	// PrometheusRecorder — all ADR-007 application metrics.
 	metricsRecorder := observability.NewPrometheusRecorder(reg)
 	log.Info().Msg("Prometheus metrics recorder initialised")
 
-	// M3-01: Real Redis Streams producer (replaces stub).
+	// M3-01: Real Redis Streams producer.
 	producer := redisadapter.NewRedisProducer(redisClient, cfg, metricsRecorder, tracer)
 
-	consumer := stubs.NewStubConsumer()
-	// TODO(M3-02): consumer = redisadapter.NewRedisConsumer(redisClient, cfg, metricsRecorder, tracer)
+	// M3-02: Real Redis Streams consumer.
+	consumer := redisadapter.NewRedisConsumer(redisClient, cfg, metricsRecorder, tracer)
 
 	retryScheduler := stubs.NewStubRetryScheduler()
 	// TODO(M3-04): retryScheduler = redisadapter.NewRedisRetryScheduler(redisClient, producer)
@@ -142,10 +121,10 @@ func main() {
 	// TODO(M3-05): idempotencyStore = redisadapter.NewRedisIdempotencyStore(redisClient, scripts, cfg)
 
 	emailSender := stubs.NewStubEmailSender()
-	// TODO(M3-07): emailSender = email.NewStubSender(0, 10*time.Millisecond)  // local dev
-	//              emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder) // prod
+	// TODO(M3-07): emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder)
 
-	// Suppress "declared and not used" for stubs that M3 issues will replace.
+	// Suppress "declared and not used" for adapters not yet wired into goroutines.
+	// M3-03 (WorkerSupervisor) will consume all of these.
 	_ = consumer
 	_ = retryScheduler
 	_ = dlqWriter
@@ -153,7 +132,7 @@ func main() {
 	_ = emailSender
 
 	// -------------------------------------------------------------------------
-	// Step 6: Construct application-layer components (stubs in M2).
+	// Step 6: Application-layer stubs (replaced in M3-03 / M3-04 / M3-06).
 	// TODO(M3-03): supervisor = worker.NewSupervisor(cfg, consumer, emailSender,
 	//                               idempotencyStore, retryScheduler, dlqWriter,
 	//                               metricsRecorder, tracer)
@@ -168,8 +147,6 @@ func main() {
 
 	// -------------------------------------------------------------------------
 	// Step 8: Launch all goroutines via errgroup.
-	// No raw go func() calls anywhere in main — every goroutine is supervised
-	// by errgroup so panics and errors are propagated uniformly (ADR-004).
 	// -------------------------------------------------------------------------
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -190,8 +167,6 @@ func main() {
 	})
 
 	// --- Prometheus metrics server ---
-	// Served on a separate port so network policy can restrict /metrics to
-	// the Prometheus scraper without exposing it on the public API port.
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		EnableOpenMetrics: true,
@@ -208,8 +183,7 @@ func main() {
 		return nil
 	})
 
-	// --- Worker supervisor (stub) ---
-	// TODO(M3-03): replace body with supervisor.Run(gCtx)
+	// --- Worker supervisor (stub until M3-03) ---
 	g.Go(func() error {
 		log.Info().Int("pool_size", cfg.Worker.PoolSize).Msg("worker supervisor started (stub)")
 		<-gCtx.Done()
@@ -217,8 +191,7 @@ func main() {
 		return nil
 	})
 
-	// --- Delayed retry scheduler (stub) ---
-	// TODO(M3-04): replace body with delayedSched.Run(gCtx)
+	// --- Delayed retry scheduler (stub until M3-04) ---
 	g.Go(func() error {
 		log.Info().Dur("interval", cfg.Retry.SchedulerInterval).Msg("delayed scheduler started (stub)")
 		<-gCtx.Done()
@@ -226,8 +199,7 @@ func main() {
 		return nil
 	})
 
-	// --- DLQ monitor (stub) ---
-	// TODO(M3-06): replace body with dlqMonitor.Run(gCtx)
+	// --- DLQ monitor (stub until M3-06) ---
 	g.Go(func() error {
 		log.Info().Msg("DLQ monitor started (stub)")
 		<-gCtx.Done()
@@ -235,27 +207,13 @@ func main() {
 		return nil
 	})
 
-	// --- Shutdown coordinator ---
-	// Follows the ADR-008 SIGTERM drain sequence step-by-step:
-	//
-	//   T+ 0s  SIGTERM received → SetReady(false) → /readyz returns 503
-	//          → load balancer drains existing connections
-	//   T+ 0s  httpServer.Shutdown(drainCtx) — stops accepting new requests,
-	//          waits for in-flight requests to complete
-	//   T+30s  drain timeout → force-close remaining connections
-	//   T+30s  redisLifecycle.Close() — log pool stats, close all connections
-	//   T+30s  shutdownObs(drainCtx) — flush OTel spans and metrics
-	//
-	// terminationGracePeriodSeconds=60 in the pod spec gives a 30s buffer
-	// between drain completion and SIGKILL (ADR-008).
+	// --- Shutdown coordinator (ADR-008 SIGTERM drain sequence) ---
 	g.Go(func() error {
 		<-gCtx.Done()
 		log.Info().Msg("shutdown signal received — beginning graceful drain")
 
-		// Step 1: flip readiness probe so the load balancer stops routing.
 		router.SetReady(false)
 
-		// Step 2: drain HTTP servers within the configured budget.
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), cfg.Worker.DrainTimeout)
 		defer drainCancel()
 
@@ -271,12 +229,10 @@ func main() {
 			log.Info().Msg("metrics server drained")
 		}
 
-		// Step 3: close Redis after all workers have stopped.
 		if err := redisLifecycle.Close(); err != nil {
 			log.Warn().Err(err).Msg("Redis close error")
 		}
 
-		// Step 4: flush OTel spans and metrics before the process exits.
 		if err := shutdownObs(drainCtx); err != nil {
 			log.Warn().Err(err).Msg("OTel shutdown error")
 		} else {
@@ -287,7 +243,6 @@ func main() {
 		return nil
 	})
 
-	// Block until all goroutines exit.
 	if err := g.Wait(); err != nil {
 		log.Error().Err(err).Msg("service exited with error")
 		os.Exit(1)
