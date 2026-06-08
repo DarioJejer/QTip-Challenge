@@ -3,6 +3,7 @@ package redis_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func newConsumerTestEnv(t *testing.T) *consumerTestEnv {
 }
 
 // seedStream pre-creates a consumer group at position "0" (so it reads already
-// added messages), XADDs one task payload, and returns the message ID.
+// added messages), XADDs one task payload, and returns the stream key and message ID.
 //
 // Using position "0" for the group allows tests to seed data before calling
 // Consume without racing against the XREADGROUP goroutine.
@@ -80,8 +81,8 @@ func seedStream(t *testing.T, env *consumerTestEnv, task *domain.EmailTask) (str
 		Stream: streamKey,
 		ID:     "*",
 		Values: map[string]any{
-			"id":       task.ID,
-			"payload":  string(payload),
+			"id":        task.ID,
+			"payload":   string(payload),
 			"tenant_id": task.TenantID,
 		},
 	}).Result()
@@ -201,7 +202,7 @@ func TestClaimStale_ReclaimsIdleMessages(t *testing.T) {
 	require.NoError(t, err)
 
 	select {
-	case <-ch: // task received and sitting in PEL
+	case <-ch: // task received; sits in PEL unacknowledged
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for task consumption")
 	}
