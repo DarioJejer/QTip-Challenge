@@ -1,6 +1,9 @@
 package ports
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // IdempotencyStore provides atomic check-and-set semantics to prevent
 // duplicate email delivery on top of Redis Streams' at-least-once guarantee.
@@ -15,7 +18,8 @@ type IdempotencyStore interface {
 	// SetProcessing atomically acquires the processing lock for taskID.
 	// It returns acquired=true if this caller is the first to claim the task.
 	// If the key already exists (status "processing" or "completed"), it
-	// returns acquired=false and the caller should XACK and skip the task.
+	// returns acquired=false and the caller should inspect IsCompleted or
+	// TryReclaimStale before deciding how to handle the task.
 	//
 	// workerID is stored in the lock value for operational debugging.
 	SetProcessing(ctx context.Context, taskID, workerID string) (acquired bool, err error)
@@ -40,4 +44,20 @@ type IdempotencyStore interface {
 	// It is safe to call on a key that has already expired or been completed —
 	// the implementation must be idempotent (DEL on a missing key is a no-op).
 	ClearProcessing(ctx context.Context, taskID string) error
+
+	// TryReclaimStale atomically takes over a processing lock that was set
+	// longer than maxAge ago. It is called at the idempotency gate when
+	// SetProcessing returns acquired=false and IsCompleted returns false,
+	// indicating the lock is in "processing" state but the original holder
+	// may have crashed without calling ClearProcessing.
+	//
+	// Returns reclaimed=true if the lock was stale and has been re-assigned
+	// to workerID. Returns reclaimed=false if the lock is recent (actively
+	// held by another worker) or already completed.
+	//
+	// maxAge should be set to cfg.Worker.ClaimIdleThreshold so the reclaim
+	// threshold aligns with the PEL reclaim threshold: if a stream message
+	// was idle long enough to be reclaimed, its idempotency lock is old
+	// enough to be considered stale.
+	TryReclaimStale(ctx context.Context, taskID, workerID string, maxAge time.Duration) (reclaimed bool, err error)
 }

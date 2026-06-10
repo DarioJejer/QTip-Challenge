@@ -96,7 +96,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		select {
 		case task, ok := <-taskCh:
 			if !ok {
-				// Channel closed by consumer when ctx was cancelled.
 				s.waitForWorkers(ctx)
 				return nil
 			}
@@ -130,12 +129,10 @@ func (s *Supervisor) dispatch(ctx context.Context, task *domain.EmailTask) {
 	}
 }
 
-// attemptKey returns the idempotency store key for this specific delivery
-// attempt. Scoping to attempt number means:
-//   - Two workers racing on the same attempt are deduplicated (acquired=false
-//     for the loser) — the core idempotency guarantee.
-//   - A later retry attempt (higher number) is NOT blocked by the previous
-//     attempt's record, so retries can proceed normally.
+// attemptKey returns the idempotency store key for a specific delivery attempt.
+// Scoping to attempt number means:
+//   - Two workers racing on the same attempt are deduplicated.
+//   - Later retry attempts (higher Attempt count) are not blocked by earlier ones.
 func attemptKey(taskID string, attempt int) string {
 	return fmt.Sprintf("%s#%d", taskID, attempt)
 }
@@ -145,14 +142,9 @@ func attemptKey(taskID string, attempt int) string {
 // write (ScheduleRetry or SendToDLQ) fails: without clearing the lock the
 // next ClaimStale re-delivery would see acquired=false for the same attempt
 // key and silently drop the task.
-//
-// If ClearProcessing itself fails, we log a critical warning and Nack anyway —
-// keeping the task in the PEL is better than losing it, even if the next
-// reclaim is at risk of being skipped.
 func (s *Supervisor) clearLockAndNack(ctx context.Context, task *domain.EmailTask, idKey string, cause error) {
-	logger := observability.LoggerFromContext(ctx)
 	if clearErr := s.idempotency.ClearProcessing(ctx, idKey); clearErr != nil {
-		logger.Error().
+		observability.LoggerFromContext(ctx).Error().
 			Err(clearErr).
 			Str("task_id", task.ID).
 			Str("id_key", idKey).
@@ -163,13 +155,10 @@ func (s *Supervisor) clearLockAndNack(ctx context.Context, task *domain.EmailTas
 
 // processTask is the per-task worker goroutine. It handles:
 //   - Panic recovery with poison-flag and nack
-//   - Idempotency gate (skip duplicate deliveries of the same attempt)
+//   - Idempotency gate with stale-lock reclaim
 //   - Email sending
 //   - Retry scheduling on transient failures
 //   - DLQ routing on permanent failures or exhausted retries
-//
-// The task context is detached from ctx so that graceful-shutdown cancellation
-// does not abort in-flight sends (context.WithoutCancel, Go 1.21+).
 func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 	atomic.AddInt64(&s.activeWorkers, 1)
 
@@ -180,7 +169,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		s.metrics.RecordWorkerStats(s.Stats())
 	}()
 
-	// Defer 2: panic recovery (runs FIRST due to LIFO — catches panics in body).
+	// Defer 2: panic recovery (runs FIRST due to LIFO).
 	defer func() {
 		if r := recover(); r != nil {
 			observability.LoggerFromContext(ctx).Error().
@@ -196,7 +185,6 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		}
 	}()
 
-	// Detach from the parent cancellation so in-flight tasks complete during drain.
 	taskCtx := context.WithoutCancel(ctx)
 	taskCtx = s.buildTraceCtx(taskCtx, task)
 	taskCtx, span := s.tracer.Start(taskCtx, "worker.process",
@@ -211,21 +199,51 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 
 	// --------------- Idempotency gate ----------------------------------------
 	//
-	// Key is scoped to (taskID, attempt) so that:
-	//   - Concurrent re-deliveries of the same attempt are deduplicated.
-	//   - Later retry attempts (incremented Attempt field) are not blocked.
+	// Key is scoped to (taskID, attempt) so concurrent re-deliveries of the
+	// same attempt are deduplicated while sequential retries are not blocked.
+	//
+	// Three outcomes when SetProcessing returns acquired=false:
+	//
+	//  1. IsCompleted=true  → task already delivered successfully; ACK + skip.
+	//  2. IsCompleted=false, TryReclaimStale=true  → previous worker crashed
+	//     and its ClearProcessing also failed; reclaim the lock and reprocess.
+	//  3. IsCompleted=false, TryReclaimStale=false → another worker is actively
+	//     processing this attempt; Nack and let it finish.
 
 	idKey := attemptKey(task.ID, task.Attempt)
 	acquired, idErr := s.idempotency.SetProcessing(taskCtx, idKey, s.cfg.Worker.ConsumerName)
 	if idErr != nil {
 		observability.LoggerFromContext(taskCtx).Warn().
 			Err(idErr).Str("task_id", task.ID).
-			Msg("worker: idempotency check failed — processing anyway")
+			Msg("worker: idempotency SetProcessing error — processing anyway")
 	}
 	if !acquired {
-		_ = s.consumer.Acknowledge(taskCtx, task)
-		s.metrics.RecordProcessed(task.TenantID, string(task.Type), "deduped", 0)
-		return
+		completed, _ := s.idempotency.IsCompleted(taskCtx, idKey)
+		if completed {
+			// Genuine duplicate — task was already delivered successfully.
+			_ = s.consumer.Acknowledge(taskCtx, task)
+			s.metrics.RecordProcessed(task.TenantID, string(task.Type), "deduped", 0)
+			return
+		}
+
+		// Lock is in "processing" state. Attempt to reclaim if stale.
+		reclaimed, reclaimErr := s.idempotency.TryReclaimStale(
+			taskCtx, idKey, s.cfg.Worker.ConsumerName, s.cfg.Worker.ClaimIdleThreshold,
+		)
+		if reclaimErr != nil {
+			observability.LoggerFromContext(taskCtx).Warn().
+				Err(reclaimErr).Str("task_id", task.ID).
+				Msg("worker: TryReclaimStale error")
+		}
+		if !reclaimed {
+			// Lock is actively held by another worker — Nack and wait.
+			_ = s.consumer.Nack(taskCtx, task, fmt.Errorf("idempotency lock actively held"))
+			return
+		}
+		observability.LoggerFromContext(taskCtx).Warn().
+			Str("task_id", task.ID).
+			Str("id_key", idKey).
+			Msg("worker: stale idempotency lock reclaimed — reprocessing task")
 	}
 
 	// --------------- Send email -----------------------------------------------
@@ -266,9 +284,6 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 			FailureReason: reason,
 			FinalError:    sendErr.Error(),
 		}
-		// Only ACK once the DLQ write is confirmed. If SendToDLQ fails, clear
-		// the idempotency lock so the PEL reclaim can re-acquire it and try
-		// again, rather than seeing acquired=false and dropping the task.
 		if dlqErr := s.dlqWriter.SendToDLQ(taskCtx, entry); dlqErr != nil {
 			observability.LoggerFromContext(taskCtx).Error().
 				Err(dlqErr).Str("task_id", task.ID).
@@ -284,15 +299,6 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		return
 	}
 
-	// Retryable: increment attempt, persist to retry sorted set, then ACK from
-	// the PEL. Incrementing before ScheduleRetry ensures the stored task
-	// carries the correct next-attempt count so IsRetryable() eventually
-	// exhausts MaxAttempts.
-	//
-	// If ScheduleRetry fails, clear the idempotency lock for the current
-	// attempt key so the PEL reclaim can re-acquire it. Without this, the
-	// reclaimed message (which still carries the original attempt number from
-	// the stream) would see acquired=false and be silently dropped.
 	task.Attempt++
 	delay := task.NextRetryDelay()
 	if schedErr := s.retryScheduler.ScheduleRetry(taskCtx, task, delay); schedErr != nil {
@@ -313,8 +319,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		Msg("task.retry_scheduled")
 }
 
-// buildTraceCtx constructs a context that carries the producer's remote span
-// as the parent, enabling end-to-end distributed trace continuity (ADR-007).
+// buildTraceCtx constructs a context carrying the producer's remote span.
 func (s *Supervisor) buildTraceCtx(ctx context.Context, task *domain.EmailTask) context.Context {
 	if task.TraceID == "" {
 		return ctx
@@ -337,16 +342,13 @@ func (s *Supervisor) buildTraceCtx(ctx context.Context, task *domain.EmailTask) 
 }
 
 // waitForWorkers blocks until all in-flight goroutines release the semaphore
-// or cfg.Worker.DrainTimeout elapses, whichever comes first.
+// or cfg.Worker.DrainTimeout elapses.
 func (s *Supervisor) waitForWorkers(ctx context.Context) {
 	logger := observability.LoggerFromContext(ctx)
-
 	drainCtx, cancel := context.WithTimeout(context.Background(), s.cfg.Worker.DrainTimeout)
 	defer cancel()
-
 	logTicker := time.NewTicker(5 * time.Second)
 	defer logTicker.Stop()
-
 	for {
 		if atomic.LoadInt64(&s.activeWorkers) == 0 {
 			logger.Info().Msg("supervisor: all workers drained")
@@ -368,17 +370,12 @@ func (s *Supervisor) waitForWorkers(ctx context.Context) {
 	}
 }
 
-// Drain waits for all in-flight workers to finish within timeout. It is called
-// by the shutdown coordinator after stopping the HTTP server and before closing
-// Redis, ensuring workers can still make Redis calls to ACK/NACK their tasks
-// (ADR-008).
+// Drain waits for all in-flight workers to finish within timeout.
 func (s *Supervisor) Drain(timeout time.Duration) error {
 	drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
 	logTicker := time.NewTicker(5 * time.Second)
 	defer logTicker.Stop()
-
 	for {
 		if atomic.LoadInt64(&s.activeWorkers) == 0 {
 			return nil
@@ -388,15 +385,13 @@ func (s *Supervisor) Drain(timeout time.Duration) error {
 			return fmt.Errorf("supervisor: drain timeout: %d workers still active",
 				atomic.LoadInt64(&s.activeWorkers))
 		case <-logTicker.C:
-			// periodic log is handled by the calling goroutine if needed
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
 
-// Stats returns a point-in-time snapshot of the supervisor's operational
-// counters using atomic loads.
+// Stats returns a point-in-time snapshot of operational counters.
 func (s *Supervisor) Stats() domain.WorkerStats {
 	return domain.WorkerStats{
 		ActiveWorkers:  atomic.LoadInt64(&s.activeWorkers),

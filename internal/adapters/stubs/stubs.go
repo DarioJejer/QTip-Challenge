@@ -42,8 +42,8 @@ type StubProducer struct{}
 // NewStubProducer returns a zero-value StubProducer.
 func NewStubProducer() *StubProducer { return &StubProducer{} }
 
-func (s *StubProducer) Enqueue(_ context.Context, _ *domain.EmailTask) error { return nil }
-func (s *StubProducer) EnqueueBatch(_ context.Context, _ []*domain.EmailTask) error { return nil }
+func (s *StubProducer) Enqueue(_ context.Context, _ *domain.EmailTask) error              { return nil }
+func (s *StubProducer) EnqueueBatch(_ context.Context, _ []*domain.EmailTask) error       { return nil }
 func (s *StubProducer) EnqueueDelayed(_ context.Context, _ *domain.EmailTask, _ time.Duration) error {
 	return nil
 }
@@ -64,8 +64,8 @@ func (s *StubConsumer) Consume(_ context.Context) (<-chan *domain.EmailTask, err
 	close(ch)
 	return ch, nil
 }
-func (s *StubConsumer) Acknowledge(_ context.Context, _ *domain.EmailTask) error { return nil }
-func (s *StubConsumer) Nack(_ context.Context, _ *domain.EmailTask, _ error) error { return nil }
+func (s *StubConsumer) Acknowledge(_ context.Context, _ *domain.EmailTask) error            { return nil }
+func (s *StubConsumer) Nack(_ context.Context, _ *domain.EmailTask, _ error) error          { return nil }
 func (s *StubConsumer) ClaimStale(_ context.Context, _ time.Duration) ([]*domain.EmailTask, error) {
 	return nil, nil
 }
@@ -118,11 +118,17 @@ func NewStubIdempotencyStore() *StubIdempotencyStore { return &StubIdempotencySt
 func (s *StubIdempotencyStore) SetProcessing(_ context.Context, _, _ string) (bool, error) {
 	return true, nil
 }
-func (s *StubIdempotencyStore) SetCompleted(_ context.Context, _ string) error  { return nil }
+func (s *StubIdempotencyStore) SetCompleted(_ context.Context, _ string) error { return nil }
 func (s *StubIdempotencyStore) IsCompleted(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
 func (s *StubIdempotencyStore) ClearProcessing(_ context.Context, _ string) error { return nil }
+
+// TryReclaimStale returns false conservatively: the stub never reclaims a lock
+// so tests that do not explicitly exercise the stale-reclaim path are unaffected.
+func (s *StubIdempotencyStore) TryReclaimStale(_ context.Context, _, _ string, _ time.Duration) (bool, error) {
+	return false, nil
+}
 
 // ---------------------------------------------------------------------------
 // StubEmailSender — ports.EmailSender
@@ -134,7 +140,7 @@ type StubEmailSender struct{}
 // NewStubEmailSender returns a zero-value StubEmailSender.
 func NewStubEmailSender() *StubEmailSender { return &StubEmailSender{} }
 
-func (s *StubEmailSender) Send(_ context.Context, _ *domain.EmailTask) error      { return nil }
+func (s *StubEmailSender) Send(_ context.Context, _ *domain.EmailTask) error        { return nil }
 func (s *StubEmailSender) SendBatch(_ context.Context, _ []*domain.EmailTask) error { return nil }
 func (s *StubEmailSender) HealthCheck(_ context.Context) error                      { return nil }
 
