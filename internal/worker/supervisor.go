@@ -230,7 +230,15 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 			FailureReason: reason,
 			FinalError:    sendErr.Error(),
 		}
-		_ = s.dlqWriter.SendToDLQ(taskCtx, entry)
+		// Only ACK once the DLQ write is confirmed. If it fails, Nack so the
+		// message stays in the PEL and is reclaimed by the next ClaimStale tick.
+		if dlqErr := s.dlqWriter.SendToDLQ(taskCtx, entry); dlqErr != nil {
+			observability.LoggerFromContext(taskCtx).Error().
+				Err(dlqErr).Str("task_id", task.ID).
+				Msg("worker: SendToDLQ failed — nacking to preserve PEL entry")
+			_ = s.consumer.Nack(taskCtx, task, dlqErr)
+			return
+		}
 		_ = s.consumer.Acknowledge(taskCtx, task)
 		s.metrics.RecordProcessed(task.TenantID, string(task.Type), "dead", duration)
 		observability.LoggerFromContext(taskCtx).Warn().
@@ -239,9 +247,17 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		return
 	}
 
-	// Retryable: schedule back-off via the sorted set and ACK from PEL.
+	// Retryable: persist to the retry sorted set first, then ACK from the PEL.
+	// If ScheduleRetry fails, Nack so the message stays in the PEL and is
+	// reclaimed by the next ClaimStale tick — never drop a retryable task.
 	delay := task.NextRetryDelay()
-	_ = s.retryScheduler.ScheduleRetry(taskCtx, task, delay)
+	if schedErr := s.retryScheduler.ScheduleRetry(taskCtx, task, delay); schedErr != nil {
+		observability.LoggerFromContext(taskCtx).Error().
+			Err(schedErr).Str("task_id", task.ID).
+			Msg("worker: ScheduleRetry failed — nacking to preserve PEL entry")
+		_ = s.consumer.Nack(taskCtx, task, schedErr)
+		return
+	}
 	_ = s.consumer.Acknowledge(taskCtx, task)
 	atomic.AddInt64(&s.totalRetried, 1)
 	s.metrics.RecordProcessed(task.TenantID, string(task.Type), "failed", duration)
