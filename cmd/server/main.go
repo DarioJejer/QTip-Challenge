@@ -21,6 +21,7 @@ import (
 	"github.com/DarioJejer/go-email-queue/internal/adapters/stubs"
 	"github.com/DarioJejer/go-email-queue/internal/config"
 	"github.com/DarioJejer/go-email-queue/internal/observability"
+	"github.com/DarioJejer/go-email-queue/internal/worker"
 )
 
 // version is injected at build time:
@@ -101,7 +102,6 @@ func main() {
 	// Step 5: Construct port implementations.
 	// -------------------------------------------------------------------------
 
-	// PrometheusRecorder — all ADR-007 application metrics.
 	metricsRecorder := observability.NewPrometheusRecorder(reg)
 	log.Info().Msg("Prometheus metrics recorder initialised")
 
@@ -123,22 +123,19 @@ func main() {
 	emailSender := stubs.NewStubEmailSender()
 	// TODO(M3-07): emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder)
 
-	// Suppress "declared and not used" for adapters not yet wired into goroutines.
-	// M3-03 (WorkerSupervisor) will consume all of these.
-	_ = consumer
-	_ = retryScheduler
-	_ = dlqWriter
-	_ = idempotencyStore
-	_ = emailSender
-
 	// -------------------------------------------------------------------------
-	// Step 6: Application-layer stubs (replaced in M3-03 / M3-04 / M3-06).
-	// TODO(M3-03): supervisor = worker.NewSupervisor(cfg, consumer, emailSender,
-	//                               idempotencyStore, retryScheduler, dlqWriter,
-	//                               metricsRecorder, tracer)
+	// Step 6: Construct application-layer components.
+	// -------------------------------------------------------------------------
+
+	// M3-03: Real worker supervisor (replaces stub goroutine).
+	supervisor := worker.NewSupervisor(
+		cfg, consumer, emailSender,
+		idempotencyStore, retryScheduler, dlqWriter,
+		metricsRecorder, tracer,
+	)
+
 	// TODO(M3-04): delayedSched = worker.NewDelayedScheduler(cfg, retryScheduler, metricsRecorder)
 	// TODO(M3-06): dlqMonitor   = worker.NewDLQMonitor(cfg, dlqWriter, metricsRecorder, []string{})
-	// -------------------------------------------------------------------------
 
 	// -------------------------------------------------------------------------
 	// Step 7: Construct the HTTP router.
@@ -183,12 +180,10 @@ func main() {
 		return nil
 	})
 
-	// --- Worker supervisor (stub until M3-03) ---
+	// --- Worker supervisor (M3-03) ---
+	// Run blocks until gCtx is cancelled, then drains in-flight tasks.
 	g.Go(func() error {
-		log.Info().Int("pool_size", cfg.Worker.PoolSize).Msg("worker supervisor started (stub)")
-		<-gCtx.Done()
-		log.Info().Msg("worker supervisor stopped")
-		return nil
+		return supervisor.Run(gCtx)
 	})
 
 	// --- Delayed retry scheduler (stub until M3-04) ---
@@ -208,6 +203,13 @@ func main() {
 	})
 
 	// --- Shutdown coordinator (ADR-008 SIGTERM drain sequence) ---
+	//
+	//   T+0s   SIGTERM → SetReady(false) → /readyz 503
+	//   T+0s   httpServer.Shutdown → drain in-flight HTTP requests
+	//   T+0s   supervisor.Drain → wait for in-flight email tasks to finish
+	//          (workers may still call Redis ACK/NACK during this window)
+	//   T+30s  redisLifecycle.Close → safe now that workers are idle
+	//   T+30s  shutdownObs → flush OTel spans
 	g.Go(func() error {
 		<-gCtx.Done()
 		log.Info().Msg("shutdown signal received — beginning graceful drain")
@@ -227,6 +229,13 @@ func main() {
 			log.Warn().Err(err).Msg("metrics server did not drain cleanly")
 		} else {
 			log.Info().Msg("metrics server drained")
+		}
+
+		// Wait for in-flight workers before closing Redis (workers still need it).
+		if err := supervisor.Drain(cfg.Worker.DrainTimeout); err != nil {
+			log.Warn().Err(err).Msg("supervisor drain timeout")
+		} else {
+			log.Info().Msg("worker supervisor drained")
 		}
 
 		if err := redisLifecycle.Close(); err != nil {
