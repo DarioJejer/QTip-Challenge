@@ -111,8 +111,8 @@ func main() {
 	// M3-02: Real Redis Streams consumer.
 	consumer := redisadapter.NewRedisConsumer(redisClient, cfg, metricsRecorder, tracer)
 
-	retryScheduler := stubs.NewStubRetryScheduler()
-	// TODO(M3-04): retryScheduler = redisadapter.NewRedisRetryScheduler(redisClient, producer)
+	// M3-04: Real retry scheduler backed by the retry sorted set.
+	retryScheduler := redisadapter.NewRedisRetryScheduler(redisClient, cfg, metricsRecorder)
 
 	dlqWriter := stubs.NewStubDLQWriter()
 	// TODO(M3-06): dlqWriter = redisadapter.NewRedisDLQWriter(redisClient, cfg, metricsRecorder)
@@ -127,15 +127,17 @@ func main() {
 	// Step 6: Construct application-layer components.
 	// -------------------------------------------------------------------------
 
-	// M3-03: Real worker supervisor (replaces stub goroutine).
+	// M3-03: Real worker supervisor.
 	supervisor := worker.NewSupervisor(
 		cfg, consumer, emailSender,
 		idempotencyStore, retryScheduler, dlqWriter,
 		metricsRecorder, tracer,
 	)
 
-	// TODO(M3-04): delayedSched = worker.NewDelayedScheduler(cfg, retryScheduler, metricsRecorder)
-	// TODO(M3-06): dlqMonitor   = worker.NewDLQMonitor(cfg, dlqWriter, metricsRecorder, []string{})
+	// M3-04: Real delayed scheduler flushes the retry sorted set on each tick.
+	delayedScheduler := worker.NewDelayedScheduler(cfg, retryScheduler, metricsRecorder)
+
+	// TODO(M3-06): dlqMonitor = worker.NewDLQMonitor(cfg, dlqWriter, metricsRecorder, []string{})
 
 	// -------------------------------------------------------------------------
 	// Step 7: Construct the HTTP router.
@@ -186,12 +188,11 @@ func main() {
 		return supervisor.Run(gCtx)
 	})
 
-	// --- Delayed retry scheduler (stub until M3-04) ---
+	// --- Delayed retry scheduler (M3-04) ---
+	// Ticks at cfg.Retry.SchedulerInterval; flushes ready tasks from the retry
+	// sorted set into their priority streams.
 	g.Go(func() error {
-		log.Info().Dur("interval", cfg.Retry.SchedulerInterval).Msg("delayed scheduler started (stub)")
-		<-gCtx.Done()
-		log.Info().Msg("delayed scheduler stopped")
-		return nil
+		return delayedScheduler.Run(gCtx)
 	})
 
 	// --- DLQ monitor (stub until M3-06) ---
@@ -204,15 +205,15 @@ func main() {
 
 	// --- Shutdown coordinator (ADR-008 SIGTERM drain sequence) ---
 	//
-	//   T+0s   SIGTERM → SetReady(false) → /readyz 503
-	//   T+0s   httpServer.Shutdown → drain in-flight HTTP requests
-	//   T+0s   supervisor.Drain → wait for in-flight email tasks to finish
+	//   T+0s   SIGTERM -> SetReady(false) -> /readyz 503
+	//   T+0s   httpServer.Shutdown -> drain in-flight HTTP requests
+	//   T+0s   supervisor.Drain -> wait for in-flight email tasks to finish
 	//          (workers may still call Redis ACK/NACK during this window)
-	//   T+30s  redisLifecycle.Close → safe now that workers are idle
-	//   T+30s  shutdownObs → flush OTel spans
+	//   T+30s  redisLifecycle.Close -> safe now that workers are idle
+	//   T+30s  shutdownObs -> flush OTel spans
 	g.Go(func() error {
 		<-gCtx.Done()
-		log.Info().Msg("shutdown signal received — beginning graceful drain")
+		log.Info().Msg("shutdown signal received -- beginning graceful drain")
 
 		router.SetReady(false)
 
