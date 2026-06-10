@@ -140,6 +140,27 @@ func attemptKey(taskID string, attempt int) string {
 	return fmt.Sprintf("%s#%d", taskID, attempt)
 }
 
+// clearLockAndNack releases the idempotency lock for idKey, then nacks the
+// task. This must be called instead of a bare Nack whenever a downstream
+// write (ScheduleRetry or SendToDLQ) fails: without clearing the lock the
+// next ClaimStale re-delivery would see acquired=false for the same attempt
+// key and silently drop the task.
+//
+// If ClearProcessing itself fails, we log a critical warning and Nack anyway —
+// keeping the task in the PEL is better than losing it, even if the next
+// reclaim is at risk of being skipped.
+func (s *Supervisor) clearLockAndNack(ctx context.Context, task *domain.EmailTask, idKey string, cause error) {
+	logger := observability.LoggerFromContext(ctx)
+	if clearErr := s.idempotency.ClearProcessing(ctx, idKey); clearErr != nil {
+		logger.Error().
+			Err(clearErr).
+			Str("task_id", task.ID).
+			Str("id_key", idKey).
+			Msg("worker: ClearProcessing failed — task may be dropped on next PEL reclaim")
+	}
+	_ = s.consumer.Nack(ctx, task, cause)
+}
+
 // processTask is the per-task worker goroutine. It handles:
 //   - Panic recovery with poison-flag and nack
 //   - Idempotency gate (skip duplicate deliveries of the same attempt)
@@ -245,13 +266,14 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 			FailureReason: reason,
 			FinalError:    sendErr.Error(),
 		}
-		// Only ACK once the DLQ write is confirmed. If it fails, Nack so the
-		// message stays in the PEL and is reclaimed by the next ClaimStale tick.
+		// Only ACK once the DLQ write is confirmed. If SendToDLQ fails, clear
+		// the idempotency lock so the PEL reclaim can re-acquire it and try
+		// again, rather than seeing acquired=false and dropping the task.
 		if dlqErr := s.dlqWriter.SendToDLQ(taskCtx, entry); dlqErr != nil {
 			observability.LoggerFromContext(taskCtx).Error().
 				Err(dlqErr).Str("task_id", task.ID).
 				Msg("worker: SendToDLQ failed — nacking to preserve PEL entry")
-			_ = s.consumer.Nack(taskCtx, task, dlqErr)
+			s.clearLockAndNack(taskCtx, task, idKey, dlqErr)
 			return
 		}
 		_ = s.consumer.Acknowledge(taskCtx, task)
@@ -262,20 +284,22 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		return
 	}
 
-	// Retryable: increment attempt count, persist to retry sorted set, then
-	// ACK from the PEL. Incrementing before ScheduleRetry ensures the stored
-	// task carries the correct next-attempt count so IsRetryable() will
-	// eventually exhaust MaxAttempts.
+	// Retryable: increment attempt, persist to retry sorted set, then ACK from
+	// the PEL. Incrementing before ScheduleRetry ensures the stored task
+	// carries the correct next-attempt count so IsRetryable() eventually
+	// exhausts MaxAttempts.
 	//
-	// If ScheduleRetry fails, Nack so the message stays in the PEL and is
-	// reclaimed by the next ClaimStale tick — never drop a retryable task.
+	// If ScheduleRetry fails, clear the idempotency lock for the current
+	// attempt key so the PEL reclaim can re-acquire it. Without this, the
+	// reclaimed message (which still carries the original attempt number from
+	// the stream) would see acquired=false and be silently dropped.
 	task.Attempt++
 	delay := task.NextRetryDelay()
 	if schedErr := s.retryScheduler.ScheduleRetry(taskCtx, task, delay); schedErr != nil {
 		observability.LoggerFromContext(taskCtx).Error().
 			Err(schedErr).Str("task_id", task.ID).
 			Msg("worker: ScheduleRetry failed — nacking to preserve PEL entry")
-		_ = s.consumer.Nack(taskCtx, task, schedErr)
+		s.clearLockAndNack(taskCtx, task, idKey, schedErr)
 		return
 	}
 	_ = s.consumer.Acknowledge(taskCtx, task)

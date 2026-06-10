@@ -53,8 +53,8 @@ func (c *chanConsumer) send(task *domain.EmailTask) { c.ch <- task }
 
 // countingSender records calls and can be configured to return an error or panic.
 type countingSender struct {
-	calls  int64
-	retErr error
+	calls   int64
+	retErr  error
 	doPanic bool
 }
 
@@ -77,10 +77,11 @@ type neverAcquireStore struct{}
 func (n *neverAcquireStore) SetProcessing(_ context.Context, _, _ string) (bool, error) {
 	return false, nil
 }
-func (n *neverAcquireStore) SetCompleted(_ context.Context, _ string) error  { return nil }
+func (n *neverAcquireStore) SetCompleted(_ context.Context, _ string) error { return nil }
 func (n *neverAcquireStore) IsCompleted(_ context.Context, _ string) (bool, error) {
 	return true, nil
 }
+func (n *neverAcquireStore) ClearProcessing(_ context.Context, _ string) error { return nil }
 
 var _ ports.IdempotencyStore = (*neverAcquireStore)(nil)
 
@@ -112,6 +113,33 @@ func newCountingRetry() *countingRetryScheduler {
 func (r *countingRetryScheduler) ScheduleRetry(ctx context.Context, task *domain.EmailTask, delay time.Duration) error {
 	atomic.AddInt64(&r.calls, 1)
 	return r.StubRetryScheduler.ScheduleRetry(ctx, task, delay)
+}
+
+// trackingIdempotencyStore records ClearProcessing calls to verify they happen
+// before Nacks in error paths.
+type trackingIdempotencyStore struct {
+	cleared int64
+	*stubs.StubIdempotencyStore
+}
+
+func newTrackingIdempotency() *trackingIdempotencyStore {
+	return &trackingIdempotencyStore{StubIdempotencyStore: stubs.NewStubIdempotencyStore()}
+}
+
+func (t *trackingIdempotencyStore) ClearProcessing(ctx context.Context, taskID string) error {
+	atomic.AddInt64(&t.cleared, 1)
+	return t.StubIdempotencyStore.ClearProcessing(ctx, taskID)
+}
+
+// failingRetryScheduler returns an error on ScheduleRetry.
+type failingRetryScheduler struct{ *stubs.StubRetryScheduler }
+
+func newFailingRetry() *failingRetryScheduler {
+	return &failingRetryScheduler{StubRetryScheduler: stubs.NewStubRetryScheduler()}
+}
+
+func (r *failingRetryScheduler) ScheduleRetry(_ context.Context, _ *domain.EmailTask, _ time.Duration) error {
+	return fmt.Errorf("redis unavailable")
 }
 
 // ---------------------------------------------------------------------------
@@ -185,12 +213,10 @@ func TestSupervisor_ProcessesTaskSuccessfully(t *testing.T) {
 
 	cons.send(validSupervisorTask("task-success-01"))
 
-	// Wait until the sender has been called.
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&sender.calls) == 1
 	}, 3*time.Second, 10*time.Millisecond, "sender must be called once")
 
-	// Consumer must have ACK'd the task.
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&cons.acked) == 1
 	}, 3*time.Second, 10*time.Millisecond, "task must be acknowledged")
@@ -219,7 +245,6 @@ func TestSupervisor_PanicRecovery(t *testing.T) {
 
 	cons.send(validSupervisorTask("task-panic-01"))
 
-	// Panicking task must be nacked.
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&cons.nacked) == 1
 	}, 3*time.Second, 10*time.Millisecond, "panicking task must be nacked")
@@ -257,7 +282,6 @@ func TestSupervisor_IdempotentSkip(t *testing.T) {
 
 	cons.send(validSupervisorTask("task-dedup-01"))
 
-	// Task must be ACK'd (removed from PEL) without calling the sender.
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&cons.acked) == 1
 	}, 3*time.Second, 10*time.Millisecond, "duplicate task must be acknowledged")
@@ -289,12 +313,10 @@ func TestSupervisor_RetriesOnFailure(t *testing.T) {
 
 	cons.send(validSupervisorTask("task-retry-01"))
 
-	// RetryScheduler must be called.
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&retryScheduler.calls) == 1
 	}, 3*time.Second, 10*time.Millisecond, "ScheduleRetry must be called")
 
-	// Task ACK'd (moved out of PEL into retry sorted set).
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&cons.acked) == 1
 	}, 3*time.Second, 10*time.Millisecond, "task must be ACK'd after retry scheduling")
@@ -322,12 +344,10 @@ func TestSupervisor_SendsToDLQOnMaxAttempts(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- sv.Run(ctx) }()
 
-	// Attempt == MaxAttempts → IsRetryable() returns false.
 	task := validSupervisorTask("task-dlq-01")
-	task.Attempt = task.MaxAttempts
+	task.Attempt = task.MaxAttempts // IsRetryable() returns false
 	cons.send(task)
 
-	// DLQWriter must be called.
 	assert.Eventually(t, func() bool {
 		return atomic.LoadInt64(&dlq.calls) == 1
 	}, 3*time.Second, 10*time.Millisecond, "task must be sent to DLQ")
@@ -342,7 +362,6 @@ func TestSupervisor_GracefulShutdown(t *testing.T) {
 	cfg := makeTestConfig()
 	cons := newChanConsumer(8)
 
-	// Slow sender: sleeps 50 ms to simulate in-flight work.
 	var processCount int64
 	sender := &slowSender{delay: 50 * time.Millisecond, counter: &processCount}
 	sv := newSupervisor(cfg, cons, sender,
@@ -356,16 +375,13 @@ func TestSupervisor_GracefulShutdown(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- sv.Run(ctx) }()
 
-	// Enqueue tasks and let them start processing before cancelling.
 	for i := 0; i < 4; i++ {
 		cons.send(validSupervisorTask(fmt.Sprintf("drain-%d", i)))
 	}
 
-	// Give tasks time to be dispatched to workers.
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 
-	// Run must return within the DrainTimeout (5 s), completing in-flight tasks.
 	select {
 	case err := <-runDone:
 		require.NoError(t, err)
@@ -373,9 +389,43 @@ func TestSupervisor_GracefulShutdown(t *testing.T) {
 		t.Fatal("supervisor did not stop within drain timeout")
 	}
 
-	// All dispatched tasks must have been processed (sender called for each).
 	assert.Equal(t, int64(4), atomic.LoadInt64(&processCount),
 		"all in-flight tasks must complete during drain")
+}
+
+// TestSupervisor_ScheduleRetryFailure_ClearsLock verifies that when
+// ScheduleRetry fails, ClearProcessing is called before Nacking so that the
+// PEL reclaim can re-acquire the idempotency lock instead of being dropped.
+func TestSupervisor_ScheduleRetryFailure_ClearsLock(t *testing.T) {
+	cfg := makeTestConfig()
+	cons := newChanConsumer(4)
+	sender := &countingSender{retErr: fmt.Errorf("transient smtp error")}
+	idempotency := newTrackingIdempotency()
+	sv := newSupervisor(cfg, cons, sender,
+		idempotency,
+		newFailingRetry(),
+		stubs.NewStubDLQWriter(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- sv.Run(ctx) }()
+
+	cons.send(validSupervisorTask("task-schedretry-fail-01"))
+
+	// Task must be nacked (stays in PEL).
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt64(&cons.nacked) == 1
+	}, 3*time.Second, 10*time.Millisecond, "task must be nacked when ScheduleRetry fails")
+
+	// ClearProcessing must have been called so the reclaim can re-acquire.
+	assert.Equal(t, int64(1), atomic.LoadInt64(&idempotency.cleared),
+		"ClearProcessing must be called before Nack to unblock PEL reclaim")
+
+	cancel()
+	require.NoError(t, <-runDone)
 }
 
 // slowSender simulates work by sleeping before returning success.
@@ -394,8 +444,15 @@ func (s *slowSender) HealthCheck(_ context.Context) error                      {
 
 var _ ports.EmailSender = (*slowSender)(nil)
 
-// Verify ErrNonRetryable routing: non-retryable error goes to DLQ even if
-// Attempt < MaxAttempts.
+// TestErrNonRetryable_ErrorsIs verifies sentinel error wrapping.
+func TestErrNonRetryable_ErrorsIs(t *testing.T) {
+	wrapped := fmt.Errorf("provider 422: %w", ports.ErrNonRetryable)
+	assert.True(t, errors.Is(wrapped, ports.ErrNonRetryable))
+	assert.False(t, errors.Is(wrapped, ports.ErrCircuitOpen))
+}
+
+// TestSupervisor_NonRetryableGoesToDLQ verifies that a non-retryable error
+// routes to DLQ even when Attempt < MaxAttempts.
 func TestSupervisor_NonRetryableGoesToDLQ(t *testing.T) {
 	cfg := makeTestConfig()
 	cons := newChanConsumer(4)
@@ -416,7 +473,6 @@ func TestSupervisor_NonRetryableGoesToDLQ(t *testing.T) {
 	go func() { runDone <- sv.Run(ctx) }()
 
 	task := validSupervisorTask("task-nonretry-01")
-	// Still has retries remaining, but error is non-retryable.
 	assert.True(t, task.IsRetryable())
 	cons.send(task)
 
@@ -429,11 +485,4 @@ func TestSupervisor_NonRetryableGoesToDLQ(t *testing.T) {
 
 	cancel()
 	require.NoError(t, <-runDone)
-}
-
-// Verify that errors.Is works correctly for our sentinel check.
-func TestErrNonRetryable_ErrorsIs(t *testing.T) {
-	wrapped := fmt.Errorf("provider 422: %w", ports.ErrNonRetryable)
-	assert.True(t, errors.Is(wrapped, ports.ErrNonRetryable))
-	assert.False(t, errors.Is(wrapped, ports.ErrCircuitOpen))
 }

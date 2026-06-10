@@ -31,4 +31,13 @@ type IdempotencyStore interface {
 	// processed. Returns true only when the stored status is "completed".
 	// Returns false for unknown keys (TTL expired) or "processing" status.
 	IsCompleted(ctx context.Context, taskID string) (bool, error)
+
+	// ClearProcessing deletes the processing lock for taskID. It is called
+	// by the worker before Nacking a task whose downstream write failed
+	// (ScheduleRetry or SendToDLQ). Without this, the PEL reclaim would see
+	// acquired=false for the same attempt key and silently drop the task.
+	//
+	// It is safe to call on a key that has already expired or been completed —
+	// the implementation must be idempotent (DEL on a missing key is a no-op).
+	ClearProcessing(ctx context.Context, taskID string) error
 }

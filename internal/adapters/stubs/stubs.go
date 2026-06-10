@@ -22,13 +22,13 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	_ ports.TaskProducer     = (*StubProducer)(nil)
-	_ ports.TaskConsumer     = (*StubConsumer)(nil)
-	_ ports.RetryScheduler   = (*StubRetryScheduler)(nil)
-	_ ports.DLQWriter        = (*StubDLQWriter)(nil)
-	_ ports.IdempotencyStore = (*StubIdempotencyStore)(nil)
-	_ ports.EmailSender      = (*StubEmailSender)(nil)
-	_ ports.MetricsRecorder  = (*StubMetricsRecorder)(nil)
+	_ ports.TaskProducer      = (*StubProducer)(nil)
+	_ ports.TaskConsumer      = (*StubConsumer)(nil)
+	_ ports.RetryScheduler    = (*StubRetryScheduler)(nil)
+	_ ports.DLQWriter         = (*StubDLQWriter)(nil)
+	_ ports.IdempotencyStore  = (*StubIdempotencyStore)(nil)
+	_ ports.EmailSender       = (*StubEmailSender)(nil)
+	_ ports.MetricsRecorder   = (*StubMetricsRecorder)(nil)
 	_ ports.QueueDepthChecker = (*StubQueueDepthChecker)(nil)
 )
 
@@ -118,10 +118,11 @@ func NewStubIdempotencyStore() *StubIdempotencyStore { return &StubIdempotencySt
 func (s *StubIdempotencyStore) SetProcessing(_ context.Context, _, _ string) (bool, error) {
 	return true, nil
 }
-func (s *StubIdempotencyStore) SetCompleted(_ context.Context, _ string) error { return nil }
+func (s *StubIdempotencyStore) SetCompleted(_ context.Context, _ string) error  { return nil }
 func (s *StubIdempotencyStore) IsCompleted(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
+func (s *StubIdempotencyStore) ClearProcessing(_ context.Context, _ string) error { return nil }
 
 // ---------------------------------------------------------------------------
 // StubEmailSender — ports.EmailSender
@@ -133,7 +134,7 @@ type StubEmailSender struct{}
 // NewStubEmailSender returns a zero-value StubEmailSender.
 func NewStubEmailSender() *StubEmailSender { return &StubEmailSender{} }
 
-func (s *StubEmailSender) Send(_ context.Context, _ *domain.EmailTask) error { return nil }
+func (s *StubEmailSender) Send(_ context.Context, _ *domain.EmailTask) error      { return nil }
 func (s *StubEmailSender) SendBatch(_ context.Context, _ []*domain.EmailTask) error { return nil }
 func (s *StubEmailSender) HealthCheck(_ context.Context) error                      { return nil }
 
@@ -148,11 +149,11 @@ type StubMetricsRecorder struct{}
 // NewStubMetricsRecorder returns a zero-value StubMetricsRecorder.
 func NewStubMetricsRecorder() *StubMetricsRecorder { return &StubMetricsRecorder{} }
 
-func (s *StubMetricsRecorder) RecordEnqueued(_, _, _ string)                         {}
-func (s *StubMetricsRecorder) RecordProcessed(_, _, _ string, _ float64)             {}
-func (s *StubMetricsRecorder) RecordQueueDepth(_ string, _ float64)                  {}
-func (s *StubMetricsRecorder) RecordDLQDepth(_, _ string, _ float64)                 {}
-func (s *StubMetricsRecorder) RecordWorkerStats(_ domain.WorkerStats)                {}
+func (s *StubMetricsRecorder) RecordEnqueued(_, _, _ string)             {}
+func (s *StubMetricsRecorder) RecordProcessed(_, _, _ string, _ float64) {}
+func (s *StubMetricsRecorder) RecordQueueDepth(_ string, _ float64)      {}
+func (s *StubMetricsRecorder) RecordDLQDepth(_, _ string, _ float64)     {}
+func (s *StubMetricsRecorder) RecordWorkerStats(_ domain.WorkerStats)    {}
 
 // ---------------------------------------------------------------------------
 // StubQueueDepthChecker — ports.QueueDepthChecker
