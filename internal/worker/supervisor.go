@@ -130,9 +130,19 @@ func (s *Supervisor) dispatch(ctx context.Context, task *domain.EmailTask) {
 	}
 }
 
+// attemptKey returns the idempotency store key for this specific delivery
+// attempt. Scoping to attempt number means:
+//   - Two workers racing on the same attempt are deduplicated (acquired=false
+//     for the loser) — the core idempotency guarantee.
+//   - A later retry attempt (higher number) is NOT blocked by the previous
+//     attempt's record, so retries can proceed normally.
+func attemptKey(taskID string, attempt int) string {
+	return fmt.Sprintf("%s#%d", taskID, attempt)
+}
+
 // processTask is the per-task worker goroutine. It handles:
 //   - Panic recovery with poison-flag and nack
-//   - Idempotency gate (skip duplicate deliveries)
+//   - Idempotency gate (skip duplicate deliveries of the same attempt)
 //   - Email sending
 //   - Retry scheduling on transient failures
 //   - DLQ routing on permanent failures or exhausted retries
@@ -179,8 +189,13 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 	defer span.End()
 
 	// --------------- Idempotency gate ----------------------------------------
+	//
+	// Key is scoped to (taskID, attempt) so that:
+	//   - Concurrent re-deliveries of the same attempt are deduplicated.
+	//   - Later retry attempts (incremented Attempt field) are not blocked.
 
-	acquired, idErr := s.idempotency.SetProcessing(taskCtx, task.ID, s.cfg.Worker.ConsumerName)
+	idKey := attemptKey(task.ID, task.Attempt)
+	acquired, idErr := s.idempotency.SetProcessing(taskCtx, idKey, s.cfg.Worker.ConsumerName)
 	if idErr != nil {
 		observability.LoggerFromContext(taskCtx).Warn().
 			Err(idErr).Str("task_id", task.ID).
@@ -200,7 +215,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 
 	if sendErr == nil {
 		_ = s.consumer.Acknowledge(taskCtx, task)
-		_ = s.idempotency.SetCompleted(taskCtx, task.ID)
+		_ = s.idempotency.SetCompleted(taskCtx, idKey)
 		atomic.AddInt64(&s.totalProcessed, 1)
 		s.metrics.RecordProcessed(task.TenantID, string(task.Type), "success", duration)
 		observability.LoggerFromContext(taskCtx).Info().
@@ -247,9 +262,14 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		return
 	}
 
-	// Retryable: persist to the retry sorted set first, then ACK from the PEL.
+	// Retryable: increment attempt count, persist to retry sorted set, then
+	// ACK from the PEL. Incrementing before ScheduleRetry ensures the stored
+	// task carries the correct next-attempt count so IsRetryable() will
+	// eventually exhaust MaxAttempts.
+	//
 	// If ScheduleRetry fails, Nack so the message stays in the PEL and is
 	// reclaimed by the next ClaimStale tick — never drop a retryable task.
+	task.Attempt++
 	delay := task.NextRetryDelay()
 	if schedErr := s.retryScheduler.ScheduleRetry(taskCtx, task, delay); schedErr != nil {
 		observability.LoggerFromContext(taskCtx).Error().
