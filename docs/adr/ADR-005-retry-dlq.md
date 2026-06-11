@@ -124,26 +124,39 @@ With ±20% jitter, retries are spread across a 20% time window. At 10k queued re
 
 ## Delayed Retry Implementation
 
+Implemented in `internal/adapters/redis/retry_scheduler.go` (M3-04) and driven by
+`internal/worker/delayed_scheduler.go`.
+
+### Responsibility split: supervisor vs scheduler
+
+| Step | Owner | Behaviour |
+|------|-------|-----------|
+| `task.Attempt++` | **Worker supervisor** | Incremented before `ScheduleRetry` so the sorted-set member carries the correct next-attempt count |
+| `ZADD NX` | **RedisRetryScheduler** | Stores task JSON as-is; does **not** increment `Attempt` again |
+| `XACK` from PEL | **Worker supervisor** | Only after `ScheduleRetry` succeeds; on failure calls `clearLockAndNack` (see below) |
+| `FlushReady` | **DelayedScheduler** | Ticker at `cfg.Retry.SchedulerInterval` (default 1 s) |
+
 ### Enqueue to delayed sorted set
 
 ```go
-func (r *RedisRetryScheduler) ScheduleRetry(ctx context.Context, task *domain.EmailTask, delay time.Duration) error {
-    task.Attempt++
-    payload, _ := json.Marshal(task)
-    score := float64(time.Now().Add(delay).Unix())
+func (s *RedisRetryScheduler) ScheduleRetry(ctx context.Context, task *domain.EmailTask, delay time.Duration) error {
+    // task.Attempt was already incremented by the supervisor.
+    payload, err := json.Marshal(task)
+    scheduledFor := time.Now().Add(delay)
 
-    return r.client.ZAddNX(ctx, "queue:email:retry:delayed",
-        redis.Z{Score: score, Member: string(payload)},
-    ).Err()
-    // NX: skip if already scheduled — prevents double-scheduling on XCLAIM redelivery
+    return s.client.ZAddArgs(ctx, "queue:email:retry:delayed", redis.ZAddArgs{
+        NX:      true,
+        Members: []redis.Z{{Score: float64(scheduledFor.Unix()), Member: string(payload)}},
+    }).Err()
+    // NX: skip if already scheduled — prevents double-scheduling on PEL redelivery
 }
 ```
 
 ### Scheduler goroutine (flushes ready tasks every second)
 
 ```go
-func (s *DelayedScheduler) Run(ctx context.Context) error {
-    ticker := time.NewTicker(s.cfg.RetrySchedulerInterval) // 1s
+func (d *DelayedScheduler) Run(ctx context.Context) error {
+    ticker := time.NewTicker(d.cfg.Retry.SchedulerInterval) // 1s
     defer ticker.Stop()
 
     for {
@@ -151,40 +164,86 @@ func (s *DelayedScheduler) Run(ctx context.Context) error {
         case <-ctx.Done():
             return nil
         case <-ticker.C:
-            if err := s.flushReady(ctx); err != nil {
-                logger.Error().Err(err).Msg("scheduler.flush_error")
+            if _, err := d.retryScheduler.FlushReady(ctx); err != nil {
+                logger.Error().Err(err).Msg("delayed scheduler: FlushReady error")
             }
         }
     }
 }
+```
 
-func (s *DelayedScheduler) flushReady(ctx context.Context) error {
-    now := strconv.FormatInt(time.Now().Unix(), 10)
+### FlushReady (re-enqueue pipeline)
 
-    // Get all tasks with score <= now (delivery time reached)
-    entries, err := s.client.ZRangeByScore(ctx, "queue:email:retry:delayed",
-        &redis.ZRangeBy{Min: "-inf", Max: now, Limit: &redis.Limit{Count: 100}},
-    ).Result()
+```go
+func (s *RedisRetryScheduler) FlushReady(ctx context.Context) ([]*domain.EmailTask, error) {
+    // 1. ZRANGEBYSCORE queue:email:retry:delayed -inf now COUNT 100
+    // 2. Unmarshal each member; corrupt JSON → quarantine (see below)
+    // 3. Pipeline: XADD per valid task + single ZREM of all valid members
+    // 4. Per-XADD failures logged; entry stays in set for next tick
+    // 5. ZCARD → RecordQueueDepth("retry:delayed", depth)  // full set size, not batch delta
 
-    if len(entries) == 0 {
-        return nil
-    }
-
-    // Pipeline: XADD each task back to main queue + ZREM from delayed set
-    pipe := s.client.Pipeline()
-    for _, entry := range entries {
-        var task domain.EmailTask
-        json.Unmarshal([]byte(entry), &task)
-        pipe.XAdd(ctx, &redis.XAddArgs{
-            Stream: task.Priority.QueueName(),
-            Values: map[string]any{"id": task.ID, "payload": entry},
-        })
-        pipe.ZRem(ctx, "queue:email:retry:delayed", entry)
-    }
-    _, err = pipe.Exec(ctx)
-    return err
+    pipe.XAdd(ctx, &redis.XAddArgs{
+        Stream: task.Priority.QueueName(),
+        Values: XAddValuesBuilder(task, payload), // canonical schema — ADR-003
+    })
 }
 ```
+
+### Canonical stream entry on re-enqueue
+
+All XADD paths (HTTP producer, retry flush, future schedulers) share
+`XAddValuesBuilder` in `internal/adapters/redis/stream_entry.go`:
+
+```go
+func XAddValuesBuilder(task *domain.EmailTask, payload string) map[string]any {
+    return map[string]any{
+        "id": task.ID, "payload": payload,
+        "enqueued_at": task.EnqueuedAt.UnixNano(),
+        "tenant_id": task.TenantID, "task_type": string(task.Type),
+        "priority": task.Priority.String(),
+        "attempt": task.Attempt, "trace_id": task.TraceID,
+    }
+}
+```
+
+The consumer unmarshals only `payload`; top-level fields exist for `redis-cli XRANGE`
+inspection and operational tooling (ADR-002, ADR-003).
+
+### Corrupt retry entry quarantine
+
+Unparseable sorted-set members cannot be flushed and must not remain in the delay
+queue (they would be re-read every tick and can block the 100-entry batch limit).
+
+**Poison list:** `queue:retry:poison` (Redis LIST)
+
+On JSON unmarshal failure during `FlushReady`:
+
+1. Build a `retryPoisonEntry` envelope (`raw_member`, `parse_error`, `quarantined_at`, `source_key`)
+2. Pipeline: `RPUSH queue:retry:poison` + `ZREM queue:email:retry:delayed`
+3. `EXPIRE queue:retry:poison` with `cfg.Retry.DLQTTLSeconds` (7 days, same as DLQ)
+
+Inspect via `redis-cli LRANGE queue:retry:poison 0 -1`. This is **not** the tenant
+DLQ — corrupt bytes cannot be routed to `queue:dlq:{tenant}:{type}`.
+
+### Worker ACK ordering and PEL safety
+
+The supervisor only XACKs after durable handoff:
+
+```
+Send fails (retryable)
+  → task.Attempt++
+  → ScheduleRetry OK  → XACK          (retry owned by sorted set)
+  → ScheduleRetry FAIL → ClearProcessing + Nack  (stay in PEL)
+
+Send fails (terminal) / max attempts
+  → SendToDLQ OK  → XACK
+  → SendToDLQ FAIL → ClearProcessing + Nack
+```
+
+`ClearProcessing` releases the attempt-scoped idempotency lock (`{taskID}#{attempt}`)
+before Nack. Without this, a PEL reclaim would see `acquired=false` and silently
+drop the task. If `ClearProcessing` itself fails, `TryReclaimStale` at the
+idempotency gate (ADR-006) recovers once the lock age exceeds `ClaimIdleThreshold`.
 
 ---
 
@@ -338,11 +397,13 @@ func (m *DLQMonitor) Run(ctx context.Context) error {
 
 ## Action Items
 
-1. [ ] Implement `RetryPolicy.ComputeDelay(attempt int)` in `internal/domain/`
-2. [ ] Implement `RedisRetryScheduler` in `internal/adapters/redis/retry_scheduler.go`
-3. [ ] Implement `DelayedScheduler.Run()` goroutine in `internal/worker/delayed_scheduler.go`
-4. [ ] Implement `RedisDLQWriter.SendToDLQ()` in `internal/adapters/redis/dlq_writer.go`
-5. [ ] Implement `DLQMonitor.Run()` goroutine in `internal/worker/dlq_monitor.go`
-6. [ ] Define `ErrNonRetryable`, `ErrCircuitOpen` sentinel errors in `internal/domain/errors.go`
-7. [ ] Wire circuit breaker into `SendGridSender` (5 failures → 30s open)
-8. [ ] Add `email_queue_retry_depth` Prometheus gauge scraped from ZCARD
+1. [x] Implement `RetryPolicy.ComputeDelay(attempt int)` in `internal/domain/`
+2. [x] Implement `RedisRetryScheduler` in `internal/adapters/redis/retry_scheduler.go`
+3. [x] Implement `DelayedScheduler.Run()` goroutine in `internal/worker/delayed_scheduler.go`
+4. [x] Implement canonical `XAddValuesBuilder` in `internal/adapters/redis/stream_entry.go`
+5. [x] Implement corrupt-entry quarantine to `queue:retry:poison`
+6. [x] Scrape `email_queue_depth{queue="retry:delayed"}` via `ZCARD` after each flush
+7. [ ] Implement `RedisDLQWriter.SendToDLQ()` in `internal/adapters/redis/dlq_writer.go`
+8. [ ] Implement `DLQMonitor.Run()` goroutine in `internal/worker/dlq_monitor.go`
+9. [ ] Define `ErrNonRetryable`, `ErrCircuitOpen` sentinel errors in `internal/ports/errors.go`
+10. [ ] Wire circuit breaker into `SendGridSender` (5 failures → 30s open)

@@ -15,12 +15,16 @@ sequenceDiagram
     Worker->>Email: Send email
     Email-->>Worker: 500 Internal Server Error (retryable)
 
-    Worker->>Worker: IsRetryable(err) = true<br/>attempt(0) < maxAttempts(5)<br/>delay = ComputeDelay(0) = ~1s + jitter
+    Worker->>Worker: IsRetryable(err) = true<br/>attempt(0) < maxAttempts(5)<br/>task.Attempt++ → delay = ComputeDelay(1) ~1s + jitter
 
     Worker->>Retry: ZADD queue:email:retry:delayed NX<br/>score=(now+delay) member=task{attempt:1}
     Retry-->>Worker: OK
 
-    Worker->>Stream: XACK (remove from PEL — retry is now owned by scheduler)
+    alt ScheduleRetry fails
+        Worker->>Worker: ClearProcessing(idempotency:{taskID}#0) + Nack<br/>(PEL entry preserved for reclaim)
+    else ScheduleRetry succeeds
+        Worker->>Stream: XACK (remove from PEL — retry owned by sorted set)
+    end
     Worker->>Worker: log task.retried, metrics.RecordProcessed(failed)
     deactivate Worker
 
@@ -29,8 +33,11 @@ sequenceDiagram
     Sched->>Retry: ZRANGEBYSCORE -inf now LIMIT 0 100
     Retry-->>Sched: [task{attempt:1}]
 
-    Sched->>Stream: XADD queue:email:{priority} * {payload: task{attempt:1}}
-    Sched->>Retry: ZREM queue:email:retry:delayed task{attempt:1}
+    Sched->>Stream: XADD {queue}:email:{priority} *<br/>XAddValuesBuilder(id, payload, attempt, trace_id, …)
+    Sched->>Retry: ZREM queue:email:retry:delayed (batch pipeline)
+    Sched->>Sched: ZCARD → RecordQueueDepth("retry:delayed")
+
+    Note over Retry,Sched: Corrupt JSON → RPUSH queue:retry:poison + ZREM<br/>(7-day TTL, ops inspect via LRANGE)
 
     Note over Stream,Worker: Task re-enters main queue with attempt=1
 
