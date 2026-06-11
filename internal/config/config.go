@@ -17,11 +17,12 @@ import (
 // Fields are grouped by subsystem. All durations are stored as time.Duration
 // so callers never need to multiply by time.Second.
 type Config struct {
-	Redis       RedisConfig
-	Worker      WorkerConfig
-	Retry       RetryConfig
+	Redis         RedisConfig
+	Worker        WorkerConfig
+	Retry         RetryConfig
+	Email         EmailConfig
 	Observability ObservabilityConfig
-	Server      ServerConfig
+	Server        ServerConfig
 }
 
 // RedisConfig controls the go-redis client connection pool (ADR-001, ADR-006).
@@ -125,6 +126,31 @@ type RetryConfig struct {
 	DLQAlertThreshold int
 }
 
+// EmailConfig controls the email delivery adapter (M3-07).
+// When SendGridAPIKey is empty the service uses RealisticStubSender for local dev.
+type EmailConfig struct {
+	// SendGridAPIKey is the SendGrid API key. Empty selects the stub sender.
+	// Env: SENDGRID_API_KEY — default "".
+	SendGridAPIKey string
+
+	// FromEmail is the sender address for SendGrid mail/send requests.
+	// Required when SendGridAPIKey is set.
+	// Env: EMAIL_FROM — default "noreply@example.com".
+	FromEmail string
+
+	// FromName is the optional display name paired with FromEmail.
+	// Env: EMAIL_FROM_NAME — default "Email Queue".
+	FromName string
+
+	// StubFailRate is the simulated failure probability [0,1] for the stub sender.
+	// Env: STUB_EMAIL_FAIL_RATE — default 0.
+	StubFailRate float64
+
+	// StubLatency is the base simulated send latency for the stub sender.
+	// Env: STUB_EMAIL_LATENCY — default 0.
+	StubLatency time.Duration
+}
+
 // ObservabilityConfig controls logging, metrics, and distributed tracing
 // (ADR-007).
 type ObservabilityConfig struct {
@@ -207,6 +233,13 @@ func Load() (*Config, error) {
 			DLQMonitorInterval:  parseDuration("DLQ_MONITOR_INTERVAL", 30*time.Second),
 			DLQAlertThreshold:   getEnvInt("DLQ_ALERT_THRESHOLD", 100),
 		},
+		Email: EmailConfig{
+			SendGridAPIKey: getEnv("SENDGRID_API_KEY", ""),
+			FromEmail:      getEnv("EMAIL_FROM", "noreply@example.com"),
+			FromName:       getEnv("EMAIL_FROM_NAME", "Email Queue"),
+			StubFailRate:   getEnvFloat("STUB_EMAIL_FAIL_RATE", 0),
+			StubLatency:    parseDuration("STUB_EMAIL_LATENCY", 0),
+		},
 		Observability: ObservabilityConfig{
 			LogLevel:     getEnv("LOG_LEVEL", "info"),
 			LogFormat:    getEnv("LOG_FORMAT", "json"),
@@ -262,6 +295,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.HTTPPort <= 0 || c.Server.HTTPPort > 65535 {
 		errs = append(errs, fmt.Sprintf("HTTP_PORT must be 1–65535, got %d", c.Server.HTTPPort))
+	}
+	if c.Email.SendGridAPIKey != "" && c.Email.FromEmail == "" {
+		errs = append(errs, "EMAIL_FROM is required when SENDGRID_API_KEY is set")
+	}
+	if c.Email.StubFailRate < 0 || c.Email.StubFailRate > 1 {
+		errs = append(errs, fmt.Sprintf("STUB_EMAIL_FAIL_RATE must be in [0, 1], got %.2f", c.Email.StubFailRate))
 	}
 
 	logLevel := strings.ToLower(c.Observability.LogLevel)

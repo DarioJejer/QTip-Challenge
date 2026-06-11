@@ -16,9 +16,10 @@ import (
 	"golang.org/x/sync/errgroup"
 	_ "go.uber.org/automaxprocs" // ADR-008: GOMAXPROCS = container CPU limit
 
+	emailadapter "github.com/DarioJejer/go-email-queue/internal/adapters/email"
 	httpadapter "github.com/DarioJejer/go-email-queue/internal/adapters/http"
 	redisadapter "github.com/DarioJejer/go-email-queue/internal/adapters/redis"
-	"github.com/DarioJejer/go-email-queue/internal/adapters/stubs"
+	"github.com/DarioJejer/go-email-queue/internal/ports"
 	"github.com/DarioJejer/go-email-queue/internal/config"
 	"github.com/DarioJejer/go-email-queue/internal/observability"
 	"github.com/DarioJejer/go-email-queue/internal/worker"
@@ -126,8 +127,23 @@ func main() {
 	// M3-05: Real Redis idempotency store backed by Lua CAS scripts.
 	idempotencyStore := redisadapter.NewRedisIdempotencyStore(redisClient, scripts, cfg)
 
-	emailSender := stubs.NewStubEmailSender()
-	// TODO(M3-07): emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder)
+	var emailSender ports.EmailSender
+	if cfg.Email.SendGridAPIKey != "" {
+		emailSender = emailadapter.NewSendGridSender(
+			cfg.Email.SendGridAPIKey,
+			cfg.Email.FromEmail,
+			cfg.Email.FromName,
+			tracer,
+			metricsRecorder,
+		)
+		log.Info().Str("from", cfg.Email.FromEmail).Msg("using SendGrid email sender")
+	} else {
+		emailSender = emailadapter.NewStubSender(cfg.Email.StubFailRate, cfg.Email.StubLatency)
+		log.Info().
+			Float64("stub_fail_rate", cfg.Email.StubFailRate).
+			Dur("stub_latency", cfg.Email.StubLatency).
+			Msg("using realistic stub email sender (no SENDGRID_API_KEY)")
+	}
 
 	// -------------------------------------------------------------------------
 	// Step 6: Construct application-layer components.
