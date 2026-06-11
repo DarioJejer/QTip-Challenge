@@ -83,9 +83,9 @@ func (p *RedisProducer) Enqueue(ctx context.Context, task *domain.EmailTask) err
 		task.SpanID = sc.SpanID().String()
 	}
 
-	payload, err := json.Marshal(task)
+	payload, err := MarshalTaskPayload(task)
 	if err != nil {
-		return fmt.Errorf("producer: marshal task %s: %w", task.ID, err)
+		return fmt.Errorf("producer: %w", err)
 	}
 
 	streamKey := task.Priority.QueueName()
@@ -93,15 +93,7 @@ func (p *RedisProducer) Enqueue(ctx context.Context, task *domain.EmailTask) err
 	if err := p.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamKey,
 		ID:     "*",
-		Values: map[string]any{
-			"id":          task.ID,
-			"payload":     string(payload),
-			"enqueued_at": task.EnqueuedAt.UnixNano(),
-			"tenant_id":   task.TenantID,
-			"task_type":   string(task.Type),
-			"priority":    task.Priority.String(),
-			"trace_id":    task.TraceID,
-		},
+		Values: XAddValuesBuilder(task, payload),
 	}).Err(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -112,7 +104,8 @@ func (p *RedisProducer) Enqueue(ctx context.Context, task *domain.EmailTask) err
 
 	p.metrics.RecordEnqueued(task.TenantID, string(task.Type), task.Priority.String())
 
-	observability.LoggerFromContext(ctx).Info().
+	logger := observability.LoggerFromContext(ctx)
+	logger.Info().
 		Str("task_id", task.ID).
 		Str("tenant_id", task.TenantID).
 		Str("task_type", string(task.Type)).
@@ -156,11 +149,11 @@ func (p *RedisProducer) EnqueueBatch(ctx context.Context, tasks []*domain.EmailT
 	// connection open during allocation-heavy JSON encoding.
 	payloads := make([]string, len(tasks))
 	for i, task := range tasks {
-		b, err := json.Marshal(task)
+		payload, err := MarshalTaskPayload(task)
 		if err != nil {
-			return fmt.Errorf("producer: marshal task %s: %w", task.ID, err)
+			return fmt.Errorf("producer: %w", err)
 		}
-		payloads[i] = string(b)
+		payloads[i] = payload
 	}
 
 	pipe := p.client.Pipeline()
@@ -168,14 +161,7 @@ func (p *RedisProducer) EnqueueBatch(ctx context.Context, tasks []*domain.EmailT
 		pipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: task.Priority.QueueName(),
 			ID:     "*",
-			Values: map[string]any{
-				"id":          task.ID,
-				"payload":     payloads[i],
-				"enqueued_at": task.EnqueuedAt.UnixNano(),
-				"tenant_id":   task.TenantID,
-				"task_type":   string(task.Type),
-				"priority":    task.Priority.String(),
-			},
+			Values: XAddValuesBuilder(task, payloads[i]),
 		})
 	}
 
@@ -198,7 +184,8 @@ func (p *RedisProducer) EnqueueBatch(ctx context.Context, tasks []*domain.EmailT
 		p.metrics.RecordEnqueued(task.TenantID, string(task.Type), task.Priority.String())
 	}
 
-	observability.LoggerFromContext(ctx).Info().
+	logger := observability.LoggerFromContext(ctx)
+	logger.Info().
 		Int("batch_size", len(tasks)).
 		Msg("task.batch_enqueued")
 
@@ -236,7 +223,8 @@ func (p *RedisProducer) EnqueueDelayed(ctx context.Context, task *domain.EmailTa
 		return fmt.Errorf("producer: enqueue delayed task %s: %w", task.ID, err)
 	}
 
-	observability.LoggerFromContext(ctx).Info().
+	logger := observability.LoggerFromContext(ctx)
+	logger.Info().
 		Str("task_id", task.ID).
 		Str("tenant_id", task.TenantID).
 		Str("task_type", string(task.Type)).

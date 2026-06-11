@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/DarioJejer/go-email-queue/internal/config"
@@ -45,7 +45,7 @@ const claimBatchSize = 100
 // RedisConsumer implements ports.TaskConsumer using Redis Streams consumer
 // groups (XREADGROUP / XACK / XAUTOCLAIM — ADR-002, ADR-004).
 type RedisConsumer struct {
-	client  *redis.Client
+	client  *goredis.Client
 	cfg     *config.Config
 	metrics ports.MetricsRecorder
 	tracer  trace.Tracer
@@ -57,7 +57,7 @@ var _ ports.TaskConsumer = (*RedisConsumer)(nil)
 // NewRedisConsumer constructs a production-grade Redis Streams consumer.
 // The tracer may be a noop tracer when OTEL is disabled (ADR-007).
 func NewRedisConsumer(
-	client *redis.Client,
+	client *goredis.Client,
 	cfg *config.Config,
 	metrics ports.MetricsRecorder,
 	tracer trace.Tracer,
@@ -141,7 +141,7 @@ func (c *RedisConsumer) pollLoop(ctx context.Context, ch chan<- *domain.EmailTas
 			return
 		}
 
-		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		streams, err := c.client.XReadGroup(ctx, &goredis.XReadGroupArgs{
 			Group:    group,
 			Consumer: consumer,
 			Streams:   streamArgs,
@@ -163,11 +163,12 @@ func (c *RedisConsumer) pollLoop(ctx context.Context, ch chan<- *domain.EmailTas
 				continue
 			}
 			// redis.Nil means BLOCK timed out with no messages — normal, keep looping.
-			if errors.Is(err, redis.Nil) {
+			if errors.Is(err, goredis.Nil) {
 				continue
 			}
 			// Unexpected error — log and keep looping to avoid crashing the pool.
-			observability.LoggerFromContext(ctx).Error().
+			logger := observability.LoggerFromContext(ctx)
+			logger.Error().
 				Err(err).
 				Msg("consumer: XREADGROUP error")
 			continue
@@ -177,7 +178,8 @@ func (c *RedisConsumer) pollLoop(ctx context.Context, ch chan<- *domain.EmailTas
 			for _, msg := range stream.Messages {
 				task, parseErr := taskFromMessage(stream.Stream, msg)
 				if parseErr != nil {
-					observability.LoggerFromContext(ctx).Error().
+					logger := observability.LoggerFromContext(ctx)
+					logger.Error().
 						Err(parseErr).
 						Str("stream", stream.Stream).
 						Str("msg_id", msg.ID).
@@ -197,7 +199,7 @@ func (c *RedisConsumer) pollLoop(ctx context.Context, ch chan<- *domain.EmailTas
 
 // taskFromMessage deserialises a Redis Stream message into a *domain.EmailTask
 // and stamps the internal routing metadata needed for subsequent XACK calls.
-func taskFromMessage(streamKey string, msg redis.XMessage) (*domain.EmailTask, error) {
+func taskFromMessage(streamKey string, msg goredis.XMessage) (*domain.EmailTask, error) {
 	payloadRaw, ok := msg.Values["payload"]
 	if !ok {
 		return nil, fmt.Errorf("message %s missing 'payload' field", msg.ID)
@@ -233,7 +235,8 @@ func (c *RedisConsumer) Acknowledge(ctx context.Context, task *domain.EmailTask)
 		return fmt.Errorf("consumer: XACK stream=%s id=%s: %w", streamKey, msgID, err)
 	}
 
-	observability.LoggerFromContext(ctx).Debug().
+	logger := observability.LoggerFromContext(ctx)
+	logger.Debug().
 		Str("task_id", task.ID).
 		Str("stream", streamKey).
 		Str("msg_id", msgID).
@@ -246,7 +249,8 @@ func (c *RedisConsumer) Acknowledge(ctx context.Context, task *domain.EmailTask)
 // PEL and will be redelivered once ClaimStale reclaims it after the idle
 // threshold elapses (ADR-004). Use this when a worker shuts down mid-task.
 func (c *RedisConsumer) Nack(ctx context.Context, task *domain.EmailTask, reason error) error {
-	observability.LoggerFromContext(ctx).Warn().
+	logger := observability.LoggerFromContext(ctx)
+	logger.Warn().
 		Str("task_id", task.ID).
 		Str("tenant_id", task.TenantID).
 		Str("msg_id", task.Metadata[metaStreamID]).
@@ -268,7 +272,7 @@ func (c *RedisConsumer) ClaimStale(ctx context.Context, idleThreshold time.Durat
 	var claimed []*domain.EmailTask
 
 	for _, streamKey := range priorityStreams {
-		msgs, _, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		msgs, _, err := c.client.XAutoClaim(ctx, &goredis.XAutoClaimArgs{
 			Stream:   streamKey,
 			Group:    group,
 			Consumer: consumer,
@@ -278,7 +282,7 @@ func (c *RedisConsumer) ClaimStale(ctx context.Context, idleThreshold time.Durat
 		}).Result()
 
 		if err != nil {
-			if errors.Is(err, redis.Nil) {
+			if errors.Is(err, goredis.Nil) {
 				continue
 			}
 			return nil, fmt.Errorf("consumer: XAUTOCLAIM stream=%s: %w", streamKey, err)
@@ -287,7 +291,8 @@ func (c *RedisConsumer) ClaimStale(ctx context.Context, idleThreshold time.Durat
 		for _, msg := range msgs {
 			task, parseErr := taskFromMessage(streamKey, msg)
 			if parseErr != nil {
-				observability.LoggerFromContext(ctx).Error().
+				logger := observability.LoggerFromContext(ctx)
+				logger.Error().
 					Err(parseErr).
 					Str("stream", streamKey).
 					Str("msg_id", msg.ID).
