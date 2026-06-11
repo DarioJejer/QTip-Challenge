@@ -144,7 +144,8 @@ func attemptKey(taskID string, attempt int) string {
 // key and silently drop the task.
 func (s *Supervisor) clearLockAndNack(ctx context.Context, task *domain.EmailTask, idKey string, cause error) {
 	if clearErr := s.idempotency.ClearProcessing(ctx, idKey); clearErr != nil {
-		observability.LoggerFromContext(ctx).Error().
+		logger := observability.LoggerFromContext(ctx)
+		logger.Error().
 			Err(clearErr).
 			Str("task_id", task.ID).
 			Str("id_key", idKey).
@@ -172,7 +173,8 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 	// Defer 2: panic recovery (runs FIRST due to LIFO).
 	defer func() {
 		if r := recover(); r != nil {
-			observability.LoggerFromContext(ctx).Error().
+			logger := observability.LoggerFromContext(ctx)
+			logger.Error().
 				Str("task_id", task.ID).
 				Interface("panic", r).
 				Msg("worker: panic recovered — nacking task")
@@ -210,10 +212,11 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 	//  3. IsCompleted=false, TryReclaimStale=false → another worker is actively
 	//     processing this attempt; Nack and let it finish.
 
+	logger := observability.LoggerFromContext(taskCtx)
 	idKey := attemptKey(task.ID, task.Attempt)
 	acquired, idErr := s.idempotency.SetProcessing(taskCtx, idKey, s.cfg.Worker.ConsumerName)
 	if idErr != nil {
-		observability.LoggerFromContext(taskCtx).Warn().
+		logger.Warn().
 			Err(idErr).Str("task_id", task.ID).
 			Msg("worker: idempotency SetProcessing error — processing anyway")
 	}
@@ -231,7 +234,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 			taskCtx, idKey, s.cfg.Worker.ConsumerName, s.cfg.Worker.ClaimIdleThreshold,
 		)
 		if reclaimErr != nil {
-			observability.LoggerFromContext(taskCtx).Warn().
+			logger.Warn().
 				Err(reclaimErr).Str("task_id", task.ID).
 				Msg("worker: TryReclaimStale error")
 		}
@@ -240,7 +243,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 			_ = s.consumer.Nack(taskCtx, task, fmt.Errorf("idempotency lock actively held"))
 			return
 		}
-		observability.LoggerFromContext(taskCtx).Warn().
+		logger.Warn().
 			Str("task_id", task.ID).
 			Str("id_key", idKey).
 			Msg("worker: stale idempotency lock reclaimed — reprocessing task")
@@ -257,7 +260,8 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		_ = s.idempotency.SetCompleted(taskCtx, idKey)
 		atomic.AddInt64(&s.totalProcessed, 1)
 		s.metrics.RecordProcessed(task.TenantID, string(task.Type), "success", duration)
-		observability.LoggerFromContext(taskCtx).Info().
+		logger := observability.LoggerFromContext(taskCtx)
+		logger.Info().
 			Str("task_id", task.ID).
 			Float64("duration_seconds", duration).
 			Msg("task.processed")
@@ -285,7 +289,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 			FinalError:    sendErr.Error(),
 		}
 		if dlqErr := s.dlqWriter.SendToDLQ(taskCtx, entry); dlqErr != nil {
-			observability.LoggerFromContext(taskCtx).Error().
+			logger.Error().
 				Err(dlqErr).Str("task_id", task.ID).
 				Msg("worker: SendToDLQ failed — nacking to preserve PEL entry")
 			s.clearLockAndNack(taskCtx, task, idKey, dlqErr)
@@ -293,7 +297,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 		}
 		_ = s.consumer.Acknowledge(taskCtx, task)
 		s.metrics.RecordProcessed(task.TenantID, string(task.Type), "dead", duration)
-		observability.LoggerFromContext(taskCtx).Warn().
+		logger.Warn().
 			Str("task_id", task.ID).Str("reason", reason).
 			Msg("task.dead_lettered")
 		return
@@ -302,7 +306,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 	task.Attempt++
 	delay := task.NextRetryDelay()
 	if schedErr := s.retryScheduler.ScheduleRetry(taskCtx, task, delay); schedErr != nil {
-		observability.LoggerFromContext(taskCtx).Error().
+		logger.Error().
 			Err(schedErr).Str("task_id", task.ID).
 			Msg("worker: ScheduleRetry failed — nacking to preserve PEL entry")
 		s.clearLockAndNack(taskCtx, task, idKey, schedErr)
@@ -311,7 +315,7 @@ func (s *Supervisor) processTask(ctx context.Context, task *domain.EmailTask) {
 	_ = s.consumer.Acknowledge(taskCtx, task)
 	atomic.AddInt64(&s.totalRetried, 1)
 	s.metrics.RecordProcessed(task.TenantID, string(task.Type), "failed", duration)
-	observability.LoggerFromContext(taskCtx).Warn().
+	logger.Warn().
 		Str("task_id", task.ID).
 		Int("attempt", task.Attempt).
 		Dur("retry_delay", delay).

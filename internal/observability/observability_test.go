@@ -78,7 +78,9 @@ func TestLoggerFromContext_FallbackToGlobal(t *testing.T) {
 	logger := observability.LoggerFromContext(context.Background())
 	// Absence of panic is the assertion; redirect to /dev/null for cleanliness.
 	var buf bytes.Buffer
-	logger.Output(&buf).Info().Msg("fallback")
+	logger.Output(&buf)
+	logger.Info().Msg("fallback")
+
 }
 
 func TestWithTaskFields(t *testing.T) {

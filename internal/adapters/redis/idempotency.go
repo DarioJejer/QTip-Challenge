@@ -75,7 +75,8 @@ func (s *RedisIdempotencyStore) SetProcessing(ctx context.Context, taskID, worke
 
 	acquired := result == 1
 	if !acquired {
-		observability.LoggerFromContext(ctx).Debug().
+		logger := observability.LoggerFromContext(ctx)
+		logger.Debug().
 			Str("task_id", taskID).
 			Msg("idempotency: lock not acquired — duplicate delivery detected")
 	}
@@ -107,7 +108,8 @@ func (s *RedisIdempotencyStore) SetCompleted(ctx context.Context, taskID string)
 		// XX condition not met — key expired while the task was in-flight.
 		// A new delivery of the same attempt would have acquired a fresh lock,
 		// so we must not overwrite it. Log and return nil.
-		observability.LoggerFromContext(ctx).Warn().
+		logger := observability.LoggerFromContext(ctx)
+		logger.Warn().
 			Str("task_id", taskID).
 			Msg("idempotency: SetCompleted XX no-op — key expired mid-flight")
 		return nil
@@ -172,7 +174,8 @@ func (s *RedisIdempotencyStore) TryReclaimStale(ctx context.Context, taskID, wor
 
 	reclaimed := result == 1
 	if reclaimed {
-		observability.LoggerFromContext(ctx).Warn().
+		logger := observability.LoggerFromContext(ctx)
+		logger.Warn().
 			Str("task_id", taskID).
 			Str("worker_id", workerID).
 			Msg("idempotency: stale lock reclaimed")

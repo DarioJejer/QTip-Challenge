@@ -32,6 +32,8 @@ var version = "dev"
 func main() {
 	// -------------------------------------------------------------------------
 	// Step 1: Load and validate configuration.
+	// All required env vars are checked here; missing values cause a fatal exit
+	// so misconfigurations are caught at startup, not at runtime (ADR-008).
 	// -------------------------------------------------------------------------
 	cfg, err := config.Load()
 	if err != nil {
@@ -80,7 +82,8 @@ func main() {
 	tracer := otel.GetTracerProvider().Tracer("email-queue")
 
 	// -------------------------------------------------------------------------
-	// Step 3: Connect to Redis.
+	// Step 3: Connect to Redis and verify connectivity.
+	// Fatal on failure — the service has no meaningful behaviour without Redis.
 	// -------------------------------------------------------------------------
 	redisClient, err := redisadapter.NewRedisClient(cfg, reg)
 	if err != nil {
@@ -117,8 +120,8 @@ func main() {
 	// M3-04: Real retry scheduler backed by the retry sorted set.
 	retryScheduler := redisadapter.NewRedisRetryScheduler(redisClient, cfg, metricsRecorder)
 
-	dlqWriter := stubs.NewStubDLQWriter()
-	// TODO(M3-06): dlqWriter = redisadapter.NewRedisDLQWriter(redisClient, cfg, metricsRecorder)
+	// M3-06: Real Redis LIST dead-letter writer.
+	dlqWriter := redisadapter.NewRedisDLQWriter(redisClient, cfg, metricsRecorder)
 
 	// M3-05: Real Redis idempotency store backed by Lua CAS scripts.
 	idempotencyStore := redisadapter.NewRedisIdempotencyStore(redisClient, scripts, cfg)
@@ -140,7 +143,8 @@ func main() {
 	// M3-04: Real delayed scheduler flushes the retry sorted set on each tick.
 	delayedScheduler := worker.NewDelayedScheduler(cfg, retryScheduler, metricsRecorder)
 
-	// TODO(M3-06): dlqMonitor = worker.NewDLQMonitor(cfg, dlqWriter, metricsRecorder, []string{})
+	// M3-06: DLQ depth monitor — scrapes known DLQ keys every 30s (configurable).
+	dlqMonitor := worker.NewDLQMonitor(cfg, dlqWriter, metricsRecorder, []string{})
 
 	// -------------------------------------------------------------------------
 	// Step 7: Construct the HTTP router.
@@ -149,6 +153,8 @@ func main() {
 
 	// -------------------------------------------------------------------------
 	// Step 8: Launch all goroutines via errgroup.
+	// No raw go func() calls anywhere in main — every goroutine is supervised
+	// by errgroup so panics and errors are propagated uniformly (ADR-004).
 	// -------------------------------------------------------------------------
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -169,6 +175,8 @@ func main() {
 	})
 
 	// --- Prometheus metrics server ---
+	// Served on a separate port so network policy can restrict /metrics to
+	// the Prometheus scraper without exposing it on the public API port.
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		EnableOpenMetrics: true,
@@ -198,12 +206,9 @@ func main() {
 		return delayedScheduler.Run(gCtx)
 	})
 
-	// --- DLQ monitor (stub until M3-06) ---
+	// --- DLQ monitor (M3-06) ---
 	g.Go(func() error {
-		log.Info().Msg("DLQ monitor started (stub)")
-		<-gCtx.Done()
-		log.Info().Msg("DLQ monitor stopped")
-		return nil
+		return dlqMonitor.Run(gCtx)
 	})
 
 	// --- Shutdown coordinator (ADR-008 SIGTERM drain sequence) ---

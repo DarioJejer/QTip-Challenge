@@ -208,9 +208,10 @@ func TestClaimStale_ReclaimsIdleMessages(t *testing.T) {
 	}
 	consumeCancel() // stop the poll goroutine
 
-	// Advance miniredis clock past the idle threshold.
-	idleThreshold := 30 * time.Second
-	env.mr.FastForward(idleThreshold + time.Second)
+	// Use wall-clock idle time — miniredis FastForward does not advance
+	// XAUTOCLAIM idle tracking reliably across all versions.
+	idleThreshold := 50 * time.Millisecond
+	time.Sleep(idleThreshold + 25*time.Millisecond)
 
 	// ClaimStale should reclaim the unacknowledged message.
 	claimed, err := env.consumer.ClaimStale(context.Background(), idleThreshold)

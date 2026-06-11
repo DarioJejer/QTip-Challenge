@@ -115,6 +115,14 @@ type RetryConfig struct {
 	// idempotency key (in seconds).
 	// Env: DLQ_TTL_SECONDS — default 604800 (7 days).
 	DLQTTLSeconds int
+
+	// DLQMonitorInterval is how often the DLQMonitor scrapes known DLQ depths.
+	// Env: DLQ_MONITOR_INTERVAL — default 30s.
+	DLQMonitorInterval time.Duration
+
+	// DLQAlertThreshold is the LLEN above which the DLQMonitor logs a warning.
+	// Env: DLQ_ALERT_THRESHOLD — default 100.
+	DLQAlertThreshold int
 }
 
 // ObservabilityConfig controls logging, metrics, and distributed tracing
@@ -195,7 +203,9 @@ func Load() (*Config, error) {
 			MaxDelay:          parseDuration("RETRY_MAX_DELAY", 15*time.Minute),
 			JitterFactor:      getEnvFloat("RETRY_JITTER_FACTOR", 0.2),
 			SchedulerInterval: parseDuration("RETRY_SCHEDULER_INTERVAL", 1*time.Second),
-			DLQTTLSeconds:     getEnvInt("DLQ_TTL_SECONDS", 604800),
+			DLQTTLSeconds:       getEnvInt("DLQ_TTL_SECONDS", 604800),
+			DLQMonitorInterval:  parseDuration("DLQ_MONITOR_INTERVAL", 30*time.Second),
+			DLQAlertThreshold:   getEnvInt("DLQ_ALERT_THRESHOLD", 100),
 		},
 		Observability: ObservabilityConfig{
 			LogLevel:     getEnv("LOG_LEVEL", "info"),
