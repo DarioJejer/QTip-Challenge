@@ -96,7 +96,10 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load Redis Lua scripts")
 	}
-	log.Info().Str("idempotency_sha", scripts.IdempotencySHA).Msg("Lua scripts loaded")
+	log.Info().
+		Str("idempotency_sha", scripts.IdempotencySHA).
+		Str("reclaim_stale_sha", scripts.ReclaimStaleSHA).
+		Msg("Lua scripts loaded")
 
 	// -------------------------------------------------------------------------
 	// Step 5: Construct port implementations.
@@ -117,8 +120,8 @@ func main() {
 	dlqWriter := stubs.NewStubDLQWriter()
 	// TODO(M3-06): dlqWriter = redisadapter.NewRedisDLQWriter(redisClient, cfg, metricsRecorder)
 
-	idempotencyStore := stubs.NewStubIdempotencyStore()
-	// TODO(M3-05): idempotencyStore = redisadapter.NewRedisIdempotencyStore(redisClient, scripts, cfg)
+	// M3-05: Real Redis idempotency store backed by Lua CAS scripts.
+	idempotencyStore := redisadapter.NewRedisIdempotencyStore(redisClient, scripts, cfg)
 
 	emailSender := stubs.NewStubEmailSender()
 	// TODO(M3-07): emailSender = email.NewSendGridSender(cfg.SendGridAPIKey, tracer, metricsRecorder)
